@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import socket
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -12,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict
 
@@ -126,6 +128,18 @@ def format_amount(value: Decimal) -> str:
     return format(quantized.normalize(), "f")
 
 
+def display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def pad_display(text: str, target_width: int) -> str:
+    padding = max(target_width - display_width(text), 0)
+    return text + (" " * padding)
+
+
 def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
     budget_config = load_budget_config(excel_path)
     period = resolve_budget_period(envelope)
@@ -144,7 +158,7 @@ def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
         else:
             unbudgeted_spent[record.category] += record.amount
 
-    lines = [f"{period} 剩余预算"]
+    rows: list[tuple[str, str, str, str]] = []
     total_budget = Decimal("0")
     total_spent = Decimal("0")
 
@@ -158,22 +172,41 @@ def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
         total_budget += budget_amount
         total_spent += spent_amount
 
-        lines.append(
-            f"{category}：剩余 {format_amount(remaining_amount)} / 预算 {format_amount(budget_amount)}（已用 {format_amount(spent_amount)}）"
+        rows.append(
+            (
+                category,
+                format_amount(remaining_amount),
+                format_amount(budget_amount),
+                format_amount(spent_amount),
+            )
         )
 
     total_remaining = total_budget - total_spent
-    lines.append(f"合计：剩余 {format_amount(total_remaining)} / 预算 {format_amount(total_budget)}（已用 {format_amount(total_spent)}）")
+    rows.append(("合计", format_amount(total_remaining), format_amount(total_budget), format_amount(total_spent)))
+
+    category_width = max(display_width("分类"), *(display_width(row[0]) for row in rows))
+    remaining_width = max(display_width("剩余"), *(display_width(row[1]) for row in rows))
+    budget_width = max(display_width("预算"), *(display_width(row[2]) for row in rows))
+    spent_width = max(display_width("已用"), *(display_width(row[3]) for row in rows))
+
+    lines = [f"{period} 剩余预算", ""]
+    lines.append(
+        f"{pad_display('分类', category_width)}  {pad_display('剩余', remaining_width)}  {pad_display('预算', budget_width)}  {pad_display('已用', spent_width)}"
+    )
+    for category, remaining_text, budget_text, spent_text in rows:
+        lines.append(
+            f"{pad_display(category, category_width)}  {pad_display(remaining_text, remaining_width)}  {pad_display(budget_text, budget_width)}  {pad_display(spent_text, spent_width)}"
+        )
 
     if unbudgeted_spent:
         extras = "，".join(
             f"{category} {format_amount(amount)}"
             for category, amount in sorted(unbudgeted_spent.items(), key=lambda item: (-item[1], item[0]))
         )
-        lines.append(f"未设预算支出：{extras}")
+        lines.extend(["", f"未设预算支出：{extras}"])
 
-    lines.append("固定支出房租、给妈妈不计入本指令显示。")
-    return "\n".join(lines)
+    lines.extend(["", "固定支出房租、给妈妈不计入本指令显示。"])
+    return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
 
 
 def classify_network_error(exc: BaseException) -> str:
@@ -528,16 +561,21 @@ def run_bridge_apply(workdir: Path, envelope: Dict[str, Any], gemini_output: Dic
     return json.loads(completed.stdout.strip())
 
 
-def send_reply(token: str, chat_id: int, reply_to_message_id: int, text: str) -> Dict[str, Any]:
-    return api_request(
-        token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "reply_to_message_id": reply_to_message_id,
-        },
-    )
+def send_reply(
+    token: str,
+    chat_id: int,
+    reply_to_message_id: int,
+    text: str,
+    parse_mode: str | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_to_message_id": reply_to_message_id,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return api_request(token, "sendMessage", payload)
 
 
 def trigger_bot_restart(verbose: bool) -> None:
@@ -608,7 +646,7 @@ def handle_message(
             if verbose:
                 log_json({"stage": "budget_failed", "message_id": envelope["message_id"], "error": str(exc)})
             reply = f"预算查询失败：{exc}"
-        send_reply(token, envelope["chat_id"], envelope["message_id"], reply)
+        send_reply(token, envelope["chat_id"], envelope["message_id"], reply, parse_mode="HTML")
         return
 
     if envelope["text"] == "作废":

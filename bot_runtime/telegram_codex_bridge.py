@@ -72,6 +72,7 @@ Rules:
 8. Currency defaults to CNY unless the message clearly says otherwise.
 9. For normal income/expense, `Category` must be one of: {categories}.
 10. For `Type = "借入"` or `Type = "贷出"` or `Type = "收回"` or `Type = "偿还"`, put the lending/borrowing counterparty in `Category`, and put the remaining context in `Note`.
+11. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`, not `人情往来`.
 
 Telegram envelope:
 {envelope}
