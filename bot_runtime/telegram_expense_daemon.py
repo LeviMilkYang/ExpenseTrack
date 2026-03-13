@@ -175,27 +175,27 @@ def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
         rows.append(
             (
                 category,
-                format_amount(remaining_amount),
                 format_amount(budget_amount),
                 format_amount(spent_amount),
+                format_amount(remaining_amount),
             )
         )
 
     total_remaining = total_budget - total_spent
-    rows.append(("合计", format_amount(total_remaining), format_amount(total_budget), format_amount(total_spent)))
+    rows.append(("合计", format_amount(total_budget), format_amount(total_spent), format_amount(total_remaining)))
 
     category_width = max(display_width("分类"), *(display_width(row[0]) for row in rows))
-    remaining_width = max(display_width("剩余"), *(display_width(row[1]) for row in rows))
-    budget_width = max(display_width("预算"), *(display_width(row[2]) for row in rows))
-    spent_width = max(display_width("已用"), *(display_width(row[3]) for row in rows))
+    budget_width = max(display_width("预算"), *(display_width(row[1]) for row in rows))
+    spent_width = max(display_width("已用"), *(display_width(row[2]) for row in rows))
+    remaining_width = max(display_width("剩余"), *(display_width(row[3]) for row in rows))
 
     lines = [f"{period} 剩余预算", ""]
     lines.append(
-        f"{pad_display('分类', category_width)}  {pad_display('剩余', remaining_width)}  {pad_display('预算', budget_width)}  {pad_display('已用', spent_width)}"
+        f"{pad_display('分类', category_width)}  {pad_display('预算', budget_width)}  {pad_display('已用', spent_width)}  {pad_display('剩余', remaining_width)}"
     )
-    for category, remaining_text, budget_text, spent_text in rows:
+    for category, budget_text, spent_text, remaining_text in rows:
         lines.append(
-            f"{pad_display(category, category_width)}  {pad_display(remaining_text, remaining_width)}  {pad_display(budget_text, budget_width)}  {pad_display(spent_text, spent_width)}"
+            f"{pad_display(category, category_width)}  {pad_display(budget_text, budget_width)}  {pad_display(spent_text, spent_width)}  {pad_display(remaining_text, remaining_width)}"
         )
 
     if unbudgeted_spent:
