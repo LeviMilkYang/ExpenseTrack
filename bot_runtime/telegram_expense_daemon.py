@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import socket
+from collections import defaultdict
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import os
 import subprocess
@@ -13,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict
 
+from openpyxl import load_workbook
+
 from append_excel_entry import (
     EXPECTED_HEADERS,
     append_record_to_excel,
@@ -21,12 +25,13 @@ from append_excel_entry import (
     normalize_record,
     read_record_from_excel,
 )
-from generate_expense_report import refresh_report_workbook
+from generate_expense_report import _load_records, refresh_report_workbook
 
 API_TIMEOUT_SECONDS = 60
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 RESTART_SCRIPT_PATH = BASE_DIR / "restart_bot.sh"
+BUDGET_SHEET_NAME = "预算"
 VOID_MARK = "作废"
 
 
@@ -66,6 +71,109 @@ def api_request(token: str, method: str, payload: Dict[str, Any] | None = None, 
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API {method} failed: {result}")
     return result
+
+
+def _to_budget_decimal(value: Any) -> Decimal:
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"预算金额非法: {value!r}") from exc
+    if amount < 0:
+        raise ValueError(f"预算金额不能为负数: {value!r}")
+    return amount
+
+
+def load_budget_config(excel_path: Path) -> Dict[str, Dict[str, Any]]:
+    workbook = load_workbook(excel_path, data_only=False)
+    if BUDGET_SHEET_NAME not in workbook.sheetnames:
+        raise ValueError(f"{excel_path.name} 中缺少“{BUDGET_SHEET_NAME}”sheet")
+
+    worksheet = workbook[BUDGET_SHEET_NAME]
+    headers = [worksheet.cell(row=1, column=idx).value for idx in range(1, 4)]
+    if headers != ["Category", "Amount", "Fixed"]:
+        raise ValueError(f"预算sheet表头不正确: {headers}")
+
+    categories: Dict[str, Dict[str, Any]] = {}
+    for row in worksheet.iter_rows(min_row=2, max_col=3, values_only=True):
+        category_value, amount_value, fixed_value = row
+        if all(value in (None, "") for value in row):
+            continue
+
+        category = str(category_value).strip()
+        if not category:
+            raise ValueError("预算sheet存在空分类")
+        categories[category] = {
+            "amount": _to_budget_decimal(amount_value),
+            "fixed": str(fixed_value).strip().lower() in {"1", "true", "yes", "y", "fixed", "是"} if fixed_value not in (None, "") else False,
+        }
+
+    if not categories:
+        raise ValueError("预算sheet中没有有效预算配置")
+    return categories
+
+
+def resolve_budget_period(envelope: Dict[str, Any]) -> str:
+    timestamp = envelope.get("telegram_timestamp")
+    if timestamp:
+        return time.strftime("%Y-%m", time.localtime(float(timestamp)))
+    return time.strftime("%Y-%m", time.localtime())
+
+
+def format_amount(value: Decimal) -> str:
+    quantized = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if quantized == quantized.to_integral():
+        return str(int(quantized))
+    return format(quantized.normalize(), "f")
+
+
+def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
+    budget_config = load_budget_config(excel_path)
+    period = resolve_budget_period(envelope)
+
+    spent_by_category: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    unbudgeted_spent: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+
+    for record in _load_records(excel_path):
+        if record.currency != "CNY" or record.record_type != "支出":
+            continue
+        if record.record_date.strftime("%Y-%m") != period:
+            continue
+
+        if record.category in budget_config:
+            spent_by_category[record.category] += record.amount
+        else:
+            unbudgeted_spent[record.category] += record.amount
+
+    lines = [f"{period} 剩余预算"]
+    total_budget = Decimal("0")
+    total_spent = Decimal("0")
+
+    for category, config in budget_config.items():
+        if config["fixed"]:
+            continue
+
+        budget_amount = config["amount"]
+        spent_amount = spent_by_category.get(category, Decimal("0"))
+        remaining_amount = budget_amount - spent_amount
+        total_budget += budget_amount
+        total_spent += spent_amount
+
+        lines.append(
+            f"{category}：剩余 {format_amount(remaining_amount)} / 预算 {format_amount(budget_amount)}（已用 {format_amount(spent_amount)}）"
+        )
+
+    total_remaining = total_budget - total_spent
+    lines.append(f"合计：剩余 {format_amount(total_remaining)} / 预算 {format_amount(total_budget)}（已用 {format_amount(total_spent)}）")
+
+    if unbudgeted_spent:
+        extras = "，".join(
+            f"{category} {format_amount(amount)}"
+            for category, amount in sorted(unbudgeted_spent.items(), key=lambda item: (-item[1], item[0]))
+        )
+        lines.append(f"未设预算支出：{extras}")
+
+    lines.append("固定支出房租、给妈妈不计入本指令显示。")
+    return "\n".join(lines)
 
 
 def classify_network_error(exc: BaseException) -> str:
@@ -482,6 +590,25 @@ def handle_message(
         queue_restart_confirmation(state_path, envelope["chat_id"], envelope["message_id"])
         send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人")
         trigger_bot_restart(verbose)
+        return
+
+    if envelope["text"] == "预算":
+        send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理预算...")
+        try:
+            reply = build_budget_reply(envelope, excel_path)
+            if verbose:
+                log_json(
+                    {
+                        "stage": "budget_viewed",
+                        "message_id": envelope["message_id"],
+                        "period": resolve_budget_period(envelope),
+                    }
+                )
+        except Exception as exc:
+            if verbose:
+                log_json({"stage": "budget_failed", "message_id": envelope["message_id"], "error": str(exc)})
+            reply = f"预算查询失败：{exc}"
+        send_reply(token, envelope["chat_id"], envelope["message_id"], reply)
         return
 
     if envelope["text"] == "作废":
