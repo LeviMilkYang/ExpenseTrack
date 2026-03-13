@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import socket
 import json
 import os
 import subprocess
@@ -40,11 +41,11 @@ def get_monthly_file_path(base_name: str, ext: str) -> Path:
 def log_json(payload: Dict[str, Any]) -> None:
     # 注入当前时间戳 (YYYY-MM-DD HH:MM:SS)
     payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    
-    # 打印到 stdout 供监控
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
-    
-    # 写入按月分割的日志文件
+
+    # 交互式运行时输出到 stdout；后台运行时只写文件，避免与 nohup 重定向重复落盘。
+    if sys.stdout.isatty():
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
     log_file = get_monthly_file_path("logs", "log")
     with log_file.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -65,6 +66,26 @@ def api_request(token: str, method: str, payload: Dict[str, Any] | None = None, 
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API {method} failed: {result}")
     return result
+
+
+def classify_network_error(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, socket.timeout):
+        return "timeout"
+
+    error_text = str(exc).lower()
+    if "timed out" in error_text:
+        return "timeout"
+    if "eof occurred in violation of protocol" in error_text:
+        return "ssl_eof"
+    if "remote end closed connection without response" in error_text:
+        return "remote_close"
+    if "handshake operation timed out" in error_text:
+        return "tls_handshake_timeout"
+    return "unknown_network_error"
 
 
 def load_state(state_path: Path) -> Dict[str, Any]:
@@ -592,13 +613,27 @@ def poll_loop(
                     handle_message(token, workdir, state_path, message, backend, excel_path, verbose)
                 except Exception as exc:
                     log_json({"stage": "handle_message_crash", "error": str(exc)})
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                if verbose:
+                    log_json(
+                        {
+                            "stage": "fatal_auth_error",
+                            "error_type": classify_network_error(exc),
+                            "error": f"HTTP Error {exc.code}: {exc.reason}",
+                        }
+                    )
+                raise RuntimeError("Telegram bot token unauthorized; exiting daemon") from exc
+            if verbose:
+                log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
+            time.sleep(5)
         except urllib.error.URLError as exc:
             if verbose:
-                log_json({"stage": "network_error", "error": str(exc)})
+                log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
             time.sleep(5)
         except Exception as exc:
             if verbose:
-                log_json({"stage": "loop_error", "error": str(exc)})
+                log_json({"stage": "loop_error", "error_type": classify_network_error(exc), "error": str(exc)})
             time.sleep(5)
 
 
