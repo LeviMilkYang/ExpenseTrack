@@ -1,0 +1,6 @@
+*.json
+*.xlsx
+*.log
+*.pid
+__pycache__/
+one_off_2026_conversion/
