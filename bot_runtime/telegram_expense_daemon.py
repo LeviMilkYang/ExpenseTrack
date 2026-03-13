@@ -328,7 +328,19 @@ def send_pending_restart_confirmation(token: str, state_path: Path, verbose: boo
         save_state(state_path, state)
         return
 
-    send_reply(token, chat_id, reply_to_message_id, "机器人已重启完成")
+    try:
+        send_reply(token, chat_id, reply_to_message_id, "机器人已重启完成")
+    except Exception as exc:
+        if verbose:
+            log_json(
+                {
+                    "stage": "restart_confirmation_failed",
+                    "chat_id": chat_id,
+                    "reply_to_message_id": reply_to_message_id,
+                    "error": str(exc),
+                }
+            )
+        return
     state.pop("pending_restart_notice", None)
     save_state(state_path, state)
     if verbose:
@@ -629,7 +641,18 @@ def handle_message(
     envelope = build_envelope(message)
     if envelope["text"] == "重启":
         queue_restart_confirmation(state_path, envelope["chat_id"], envelope["message_id"])
-        send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人")
+        try:
+            send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人")
+        except Exception as exc:
+            if verbose:
+                log_json(
+                    {
+                        "stage": "restart_ack_failed",
+                        "message_id": envelope["message_id"],
+                        "chat_id": envelope["chat_id"],
+                        "error": str(exc),
+                    }
+                )
         trigger_bot_restart(verbose)
         return
 
