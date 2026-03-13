@@ -205,7 +205,7 @@ def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
         )
         lines.extend(["", f"未设预算支出：{extras}"])
 
-    lines.extend(["", "固定支出房租、给妈妈不计入本指令显示。"])
+    lines.extend(["", "固定分类项目不在本指令明细中展示。"])
     return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
 
 
