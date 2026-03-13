@@ -21,6 +21,8 @@ from openpyxl import load_workbook
 
 from append_excel_entry import (
     EXPECTED_HEADERS,
+    STATUS_PENDING,
+    STATUS_VOID,
     append_record_to_excel,
     invalidate_last_record_in_excel,
     invalidate_record_in_excel,
@@ -34,7 +36,8 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 RESTART_SCRIPT_PATH = BASE_DIR / "restart_bot.sh"
 BUDGET_SHEET_NAME = "预算"
-VOID_MARK = "作废"
+CONFIG_FILE_NAME = "telegram_bot_config.json"
+VOID_MARK = STATUS_VOID
 
 
 def get_monthly_file_path(base_name: str, ext: str) -> Path:
@@ -299,7 +302,7 @@ def load_token(state_path: Path, legacy_token_path: Path | None = None) -> str:
             save_state(state_path, state)
             return legacy_token
 
-    raise ValueError("telegram_bot_state.json 中缺少 token")
+    raise ValueError(f"{CONFIG_FILE_NAME} 中缺少 token")
 
 
 def queue_restart_confirmation(state_path: Path, chat_id: int, reply_to_message_id: int) -> None:
@@ -447,7 +450,7 @@ def invalidate_reply_target(
         raise ValueError("索引记录不完整，无法执行作废")
 
     current_record = read_record_from_excel(excel_path, row=row, sheet_name=sheet_name, backend=backend)
-    if str(current_record.get("NeedConfirm", "")).strip() == VOID_MARK:
+    if str(current_record.get("Status", "")).strip() == VOID_MARK:
         entry["voided"] = True
         entry["voided_at"] = int(time.time())
         save_message_index(index)
@@ -610,7 +613,7 @@ def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "Type": "支出",
         "Category": "未分类",
         "Note": f"[AI失败兜底] {envelope['text']}",
-        "NeedConfirm": True,
+        "Status": STATUS_PENDING,
     }
 
 
@@ -714,7 +717,7 @@ def handle_message(
         if fallback_used:
             reply = f"⚠️ AI 处理失败，已为您自动记录原文：\n{record_type} / {category} / {amount}\n备注：{note}\n请稍后手动核对（第 {result['row']} 行）"
         else:
-            confirm_hint = "，待确认" if result["record"]["NeedConfirm"] else ""
+            confirm_hint = "，待确认" if result["record"]["Status"] == STATUS_PENDING else ""
             reply = f"已记账：{record_type} / {category} / {amount}"
             if note:
                 reply += f" / {note}"
@@ -804,7 +807,7 @@ def poll_loop(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Telegram expense bot daemon.")
-    parser.add_argument("--state-file", default=str(BASE_DIR / "telegram_bot_state.json"))
+    parser.add_argument("--state-file", default=str(BASE_DIR / CONFIG_FILE_NAME))
     parser.add_argument("--legacy-token-file", default=str(BASE_DIR / "bot_token.txt"))
     parser.add_argument("--excel-path", default="")
     parser.add_argument("--backend", choices=["win32com", "openpyxl"], default="openpyxl")

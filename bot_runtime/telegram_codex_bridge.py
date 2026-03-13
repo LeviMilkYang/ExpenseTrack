@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from append_excel_entry import ALLOWED_CATEGORIES, append_record_to_excel, normalize_record
+from append_excel_entry import append_record_to_excel, get_allowed_categories, normalize_record
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -25,7 +25,7 @@ CODEX_RECORD_SCHEMA: Dict[str, Any] = {
         "record": {
             "type": ["object", "null"],
             "additionalProperties": False,
-            "required": ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "NeedConfirm"],
+            "required": ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"],
             "properties": {
                 "Date": {"type": "string"},
                 "Time": {"type": "string"},
@@ -34,7 +34,7 @@ CODEX_RECORD_SCHEMA: Dict[str, Any] = {
                 "Type": {"type": "string", "enum": ["鏀跺叆", "鏀嚭", "鍊熷叆", "璐峰嚭", "鏀跺洖", "鍋胯繕"]},
                 "Category": {"type": "string"},
                 "Note": {"type": "string"},
-                "NeedConfirm": {"type": "boolean"},
+                "Status": {"type": "string"},
             },
         },
     },
@@ -54,7 +54,7 @@ PROMPT_RECORD_SHAPE: Dict[str, Any] = {
     "Type": "allowed type value",
     "Category": "string",
     "Note": "string",
-    "NeedConfirm": False,
+    "Status": "",
 }
 PROMPT_TEMPLATE = """You convert one Telegram bookkeeping message into exactly one JSON object.
 
@@ -66,13 +66,14 @@ Rules:
 {{"ignored":true,"reason":"short reason","record":null}}
 4. Otherwise set `"ignored": false`, `"reason": ""`, and make `record` use this schema:
 {record_shape}
-5. If the bookkeeping content is ambiguous, still output valid JSON and set "NeedConfirm": true.
+5. If the bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
 6. If the message does not explicitly mention a date or time, set `Date` to `""` and `Time` to `""`. Do not copy Telegram metadata timestamps into `record`.
 7. Keep "Note" concise and preserve useful source wording, but do not repeat the numeric amount or currency in "Note" unless necessary for meaning.
 8. Currency defaults to CNY unless the message clearly says otherwise.
-9. For normal income/expense, `Category` must be one of: {categories}.
-10. For `Type = "借入"` or `Type = "贷出"` or `Type = "收回"` or `Type = "偿还"`, put the lending/borrowing counterparty in `Category`, and put the remaining context in `Note`.
-11. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`, not `人情往来`.
+9. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records. Never use boolean values.
+10. For normal income/expense, `Category` must be one of: {categories}.
+11. For `Type = "借入"` or `Type = "贷出"` or `Type = "收回"` or `Type = "偿还"`, put the lending/borrowing counterparty in `Category`, and put the remaining context in `Note`.
+12. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`, not `人情往来`.
 
 Telegram envelope:
 {envelope}
@@ -208,8 +209,8 @@ def _fill_defaults(record: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str,
 
     if not str(merged.get("Currency", "")).strip():
         merged["Currency"] = "CNY"
-    if "NeedConfirm" not in merged:
-        merged["NeedConfirm"] = False
+    if "Status" not in merged and "NeedConfirm" not in merged:
+        merged["Status"] = ""
     return merged
 
 
@@ -237,7 +238,7 @@ def emit_prompt(payload: Dict[str, Any]) -> str:
         "text": _message_text(payload),
     }
     return PROMPT_TEMPLATE.format(
-        categories="|".join(sorted(ALLOWED_CATEGORIES)),
+        categories="|".join(sorted(get_allowed_categories())),
         output_shape=json.dumps(PROMPT_OUTPUT_SHAPE, ensure_ascii=False),
         record_shape=json.dumps(PROMPT_RECORD_SHAPE, ensure_ascii=False),
         envelope=json.dumps(minimal_envelope, ensure_ascii=False),

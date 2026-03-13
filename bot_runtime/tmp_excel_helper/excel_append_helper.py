@@ -7,8 +7,8 @@ from datetime import date, datetime
 from pathlib import Path
 from openpyxl import load_workbook
 
-EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "NeedConfirm"]
-NEED_CONFIRM_COL = EXPECTED_HEADERS.index("NeedConfirm") + 1
+EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
 
 
 def row_values(worksheet, row: int) -> list[object]:
@@ -84,7 +84,7 @@ def main() -> int:
 
     if action == "invalidate_last":
         target_row = find_last_record_row(worksheet)
-        worksheet.cell(row=target_row, column=NEED_CONFIRM_COL, value="作废")
+        worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
         workbook.save(excel_path)
 
         print(json.dumps({"row": target_row}, ensure_ascii=False))
@@ -92,7 +92,7 @@ def main() -> int:
 
     if action == "invalidate_row":
         target_row = find_record_row(worksheet, int(payload["row"]))
-        worksheet.cell(row=target_row, column=NEED_CONFIRM_COL, value="作废")
+        worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
         workbook.save(excel_path)
 
         print(json.dumps({"row": target_row}, ensure_ascii=False))

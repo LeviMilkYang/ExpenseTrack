@@ -11,6 +11,13 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 DEFAULT_EXCEL_PATH = PROJECT_DIR / "expense.xlsx"
 HELPER_TEMP_DIR = BASE_DIR / "tmp_excel_helper"
+DEFAULT_CONFIG_PATH = BASE_DIR / "telegram_bot_config.json"
+FALLBACK_CATEGORY = "未分类"
+
+STATUS_NORMAL = ""
+STATUS_PENDING = "待确认"
+STATUS_VOID = "作废"
+ALLOWED_STATUS = {STATUS_NORMAL, STATUS_PENDING, STATUS_VOID}
 
 EXPECTED_HEADERS = [
     "Date",
@@ -20,7 +27,7 @@ EXPECTED_HEADERS = [
     "Type",
     "Category",
     "Note",
-    "NeedConfirm",
+    "Status",
 ]
 
 FIELD_ALIASES = {
@@ -31,7 +38,7 @@ FIELD_ALIASES = {
     "Type": ("Type", "type", "收支"),
     "Category": ("Category", "category", "分类"),
     "Note": ("Note", "note", "备注"),
-    "NeedConfirm": ("NeedConfirm", "need_confirm", "待确认"),
+    "Status": ("Status", "status", "状态", "NeedConfirm", "need_confirm", "待确认"),
 }
 
 TYPE_ALIASES = {
@@ -66,7 +73,7 @@ TYPE_ALIASES = {
 ALLOWED_TYPES = {"收入", "支出", "借入", "贷出", "收回", "偿还"}
 LOAN_TYPES = {"借入", "贷出", "收回", "偿还"}
 
-ALLOWED_CATEGORIES = {
+DEFAULT_ALLOWED_CATEGORIES = [
     "吃喝",
     "日用消耗",
     "交通",
@@ -78,7 +85,7 @@ ALLOWED_CATEGORIES = {
     "工资",
     "公积金",
     "房租",
-}
+]
 
 HELPER_CODE_OPENPYXL = r"""
 from __future__ import annotations
@@ -89,8 +96,8 @@ from datetime import date, datetime
 from pathlib import Path
 from openpyxl import load_workbook
 
-EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "NeedConfirm"]
-NEED_CONFIRM_COL = EXPECTED_HEADERS.index("NeedConfirm") + 1
+EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
 
 
 def row_values(worksheet, row: int) -> list[object]:
@@ -166,7 +173,7 @@ def main() -> int:
 
     if action == "invalidate_last":
         target_row = find_last_record_row(worksheet)
-        worksheet.cell(row=target_row, column=NEED_CONFIRM_COL, value="作废")
+        worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
         workbook.save(excel_path)
 
         print(json.dumps({"row": target_row}, ensure_ascii=False))
@@ -174,7 +181,7 @@ def main() -> int:
 
     if action == "invalidate_row":
         target_row = find_record_row(worksheet, int(payload["row"]))
-        worksheet.cell(row=target_row, column=NEED_CONFIRM_COL, value="作废")
+        worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
         workbook.save(excel_path)
 
         print(json.dumps({"row": target_row}, ensure_ascii=False))
@@ -212,8 +219,8 @@ from pathlib import Path
 
 import win32com.client as win32
 
-EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "NeedConfirm"]
-NEED_CONFIRM_COL = EXPECTED_HEADERS.index("NeedConfirm") + 1
+EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
 
 
 def row_values(worksheet, row: int) -> list[object]:
@@ -299,7 +306,7 @@ def main() -> int:
 
         if action == "invalidate_last":
             target_row = find_last_record_row(worksheet)
-            worksheet.Cells(target_row, NEED_CONFIRM_COL).Value = "作废"
+            worksheet.Cells(target_row, STATUS_COL).Value = "作废"
             workbook.Save()
 
             print(json.dumps({"row": target_row}, ensure_ascii=False))
@@ -307,7 +314,7 @@ def main() -> int:
 
         if action == "invalidate_row":
             target_row = find_record_row(worksheet, int(payload["row"]))
-            worksheet.Cells(target_row, NEED_CONFIRM_COL).Value = "作废"
+            worksheet.Cells(target_row, STATUS_COL).Value = "作废"
             workbook.Save()
 
             print(json.dumps({"row": target_row}, ensure_ascii=False))
@@ -348,11 +355,42 @@ def _pick_value(record: Dict[str, Any], field: str) -> Any:
     return None
 
 
+def load_bot_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    if not config_path.exists():
+        return {"allowed_categories": list(DEFAULT_ALLOWED_CATEGORIES)}
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def get_allowed_categories(config_path: Path = DEFAULT_CONFIG_PATH) -> set[str]:
+    config = load_bot_config(config_path)
+    raw_categories = config.get("allowed_categories", DEFAULT_ALLOWED_CATEGORIES)
+    if not isinstance(raw_categories, list) or not raw_categories:
+        raise ValueError("telegram_bot_config.json 中的 allowed_categories 非法")
+    categories = {str(item).strip() for item in raw_categories if str(item).strip()}
+    if not categories:
+        raise ValueError("telegram_bot_config.json 中的 allowed_categories 不能为空")
+    return categories
+
+
+def normalize_status(raw_value: Any) -> str:
+    if raw_value in (None, "", False, 0, "0", "false", "False", "否", "normal", "Normal"):
+        return STATUS_NORMAL
+    if raw_value in (True, 1, "1", "true", "True", "是", "yes", "Yes"):
+        return STATUS_PENDING
+
+    text = str(raw_value).strip()
+    if text == "":
+        return STATUS_NORMAL
+    if text not in ALLOWED_STATUS:
+        raise ValueError(f"状态字段非法: {raw_value}")
+    return text
+
+
 def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for field in EXPECTED_HEADERS:
         value = _pick_value(record, field)
-        if field != "NeedConfirm" and value is None:
+        if field != "Status" and value is None:
             raise ValueError(f"缺少必填字段: {field}")
         normalized[field] = value
 
@@ -364,7 +402,8 @@ def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     category = str(normalized["Category"]).strip()
     if not category:
         raise ValueError("分类字段不能为空")
-    if normalized_type not in LOAN_TYPES and category not in ALLOWED_CATEGORIES:
+    allowed_categories = get_allowed_categories()
+    if normalized_type not in LOAN_TYPES and category not in allowed_categories and category != FALLBACK_CATEGORY:
         raise ValueError(f"分类字段非法: {category}")
 
     try:
@@ -372,8 +411,7 @@ def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         raise ValueError(f"金额无法转换为数字: {normalized['Amount']}") from exc
 
-    pending_raw = normalized.get("NeedConfirm", False)
-    pending = "是" if pending_raw in (True, 1, "1", "true", "True", "是", "yes", "Yes") else ""
+    status = normalize_status(normalized.get("Status", STATUS_NORMAL))
 
     return {
         "Date": str(normalized["Date"]).strip(),
@@ -383,7 +421,7 @@ def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "Type": normalized_type,
         "Category": category,
         "Note": str(normalized["Note"]).strip(),
-        "NeedConfirm": pending,
+        "Status": status,
     }
 
 
@@ -516,7 +554,7 @@ def _record_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "Type": args.type,
         "Category": args.category,
         "Note": args.note,
-        "NeedConfirm": args.need_confirm,
+        "Status": args.status,
     }
 
 
@@ -555,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--type")
     parser.add_argument("--category")
     parser.add_argument("--note")
-    parser.add_argument("--need-confirm", action="store_true")
+    parser.add_argument("--status")
     return parser
 
 

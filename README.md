@@ -18,7 +18,7 @@
 
 ## 本地私有配置
 
-所有本地私密配置都保存在 `bot_runtime/telegram_bot_state.json`，不要提交到 Git。
+所有本地私密配置都保存在 `bot_runtime/telegram_bot_config.json`，不要提交到 Git。
 
 当前这个文件里至少会用到这些字段：
 
@@ -26,6 +26,7 @@
 - `offset`：Telegram `getUpdates` 的消费游标
 - `allowed_username`：白名单 Telegram 用户名
 - `project_dir`：项目根目录绝对路径，用来推导 `expense.xlsx` 和 `expense_report.xlsx`
+- `allowed_categories`：合法收支分类集合
 
 ## 核心特性
 
@@ -41,7 +42,7 @@
     - `作废`：支持直接回复某条记录进行精确作废，或作废上一条记录。
     - `预算`：读取 `expense.xlsx` 的 `预算` sheet，显示当月预算项的已用额度和剩余额度；`Fixed` 标记为真时，该项不在预算明细中展示。
 - **自动补全**：若消息无明确日期时间，优先使用 Telegram 消息的时间戳。
-- **报表联动**：`NeedConfirm = 作废` 的记录不会计入统计，报表每月自动刷新。
+- **报表联动**：`Status = 作废` 的记录不会计入统计，报表每月自动刷新。
 - **认证失败快速退出**：若 Telegram API 返回 `401 Unauthorized`，守护进程会记录致命认证错误并直接退出，避免持续刷日志。
 
 ## 运行与维护

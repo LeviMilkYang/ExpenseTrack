@@ -4,7 +4,7 @@ set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$BASE_DIR/.." && pwd)"
-STATE_FILE="$BASE_DIR/telegram_bot_state.json"
+STATE_FILE="$BASE_DIR/telegram_bot_config.json"
 PID_FILE="$BASE_DIR/telegram_expense_daemon.pid"
 
 # 日志目录

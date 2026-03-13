@@ -20,7 +20,7 @@ PROJECT_DIR = BASE_DIR.parent
 DEFAULT_SOURCE_PATH = PROJECT_DIR / "expense.xlsx"
 DEFAULT_REPORT_PATH = PROJECT_DIR / "expense_report.xlsx"
 
-DATA_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "NeedConfirm"]
+DATA_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
 BAR_HEADERS = ["期间", "收入合计", "支出合计", "结余合计"]
 PIE_HEADERS = ["分类", "支出合计"]
 LOAN_TYPES = {"借入", "贷出", "收回", "偿还"}
@@ -131,8 +131,8 @@ def _load_records(source_path: Path) -> list[LedgerRecord]:
             if record_type not in {"收入", "支出"}:
                 continue
 
-            need_confirm = "" if row[7] is None else str(row[7]).strip()
-            if need_confirm == VOID_MARK:
+            status = "" if row[7] is None else str(row[7]).strip()
+            if status == VOID_MARK:
                 continue
 
             amount = _to_decimal(row[2])
@@ -147,7 +147,7 @@ def _load_records(source_path: Path) -> list[LedgerRecord]:
                     currency=str(row[3]).strip() or "CNY",
                     record_type=record_type,
                     category=str(row[5]).strip(),
-                    need_confirm=need_confirm,
+                    need_confirm=status,
                 )
             )
     return records
@@ -360,7 +360,7 @@ def refresh_report_workbook(source_path: str | Path, report_path: str | Path | N
     index_sheet["A6"] = "规则："
     index_sheet["A7"] = "1. 仅统计收入/支出。"
     index_sheet["A8"] = "2. 借入、贷出、收回、偿还不计入统计。"
-    index_sheet["A9"] = "3. NeedConfirm=作废 的记录不计入统计。"
+    index_sheet["A9"] = "3. Status=作废 的记录不计入统计。"
     index_sheet["A10"] = "4. 报表是独立工作簿，不会修改原始记账数据。"
     _autosize(index_sheet)
 
