@@ -73,8 +73,8 @@ Rules:
 {{"ignored":true,"reason":"short reason","record":null}}
 4. Otherwise set `"ignored": false`, `"reason": ""`, and make `record` use this schema:
 {record_shape}
-5. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号"). DO NOT set true for relative words like "yesterday", "today", "the day before yesterday".
-6. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点"). DO NOT set true for fuzzy words like "morning", "afternoon", "evening", "just now".
+5. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号").
+6. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点").
 7. If bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
 8. Currency defaults to CNY unless specified.
 9. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records.
