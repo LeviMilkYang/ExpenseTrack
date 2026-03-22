@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import html
-import socket
-from collections import defaultdict
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import os
 import subprocess
@@ -13,35 +9,42 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import unicodedata
 from pathlib import Path
 from typing import Any, Dict
-
-from openpyxl import load_workbook
 
 from append_excel_entry import (
     EXPECTED_HEADERS,
     STATUS_PENDING,
-    STATUS_VOID,
     append_record_to_excel,
     invalidate_last_record_in_excel,
-    invalidate_record_in_excel,
+    invalidate_record_by_id,
     normalize_record,
-    read_record_from_excel,
+    read_record_by_id,
 )
-from generate_expense_report import _load_records, refresh_report_workbook
+from generate_expense_report import refresh_report_workbook
 
 API_TIMEOUT_SECONDS = 60
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 RESTART_SCRIPT_PATH = BASE_DIR / "restart_bot.sh"
-BUDGET_SHEET_NAME = "预算"
-CONFIG_FILE_NAME = "telegram_bot_config.json"
-VOID_MARK = STATUS_VOID
+VOID_MARK = "作废"
+CONFIG_FILE_NAME = "telegram_bot_state.json"
+
+
+def classify_network_error(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "eof occurred" in msg:
+        return "ssl_eof"
+    if "handshake operation timed out" in msg:
+        return "ssl_handshake_timeout"
+    if "read operation timed out" in msg:
+        return "timeout"
+    if "remote end closed connection" in msg:
+        return "remote_close"
+    return "other"
 
 
 def get_monthly_file_path(base_name: str, ext: str) -> Path:
-    """返回如 logs/2026-03.log 或 indexes/2026-03.json 的路径"""
     month_str = time.strftime("%Y-%m", time.localtime())
     folder = BASE_DIR / base_name
     folder.mkdir(parents=True, exist_ok=True)
@@ -49,16 +52,14 @@ def get_monthly_file_path(base_name: str, ext: str) -> Path:
 
 
 def log_json(payload: Dict[str, Any]) -> None:
-    # 注入当前时间戳 (YYYY-MM-DD HH:MM:SS)
     payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-    # 交互式运行时输出到 stdout；后台运行时只写文件，避免与 nohup 重定向重复落盘。
-    if sys.stdout.isatty():
-        print(json.dumps(payload, ensure_ascii=False), flush=True)
-
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
     log_file = get_monthly_file_path("logs", "log")
-    with log_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    try:
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except:
+        pass
 
 
 def api_request(token: str, method: str, payload: Dict[str, Any] | None = None, timeout: int = 30) -> Dict[str, Any]:
@@ -76,160 +77,6 @@ def api_request(token: str, method: str, payload: Dict[str, Any] | None = None, 
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API {method} failed: {result}")
     return result
-
-
-def _to_budget_decimal(value: Any) -> Decimal:
-    try:
-        amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError(f"预算金额非法: {value!r}") from exc
-    if amount < 0:
-        raise ValueError(f"预算金额不能为负数: {value!r}")
-    return amount
-
-
-def load_budget_config(excel_path: Path) -> Dict[str, Dict[str, Any]]:
-    workbook = load_workbook(excel_path, data_only=False)
-    if BUDGET_SHEET_NAME not in workbook.sheetnames:
-        raise ValueError(f"{excel_path.name} 中缺少“{BUDGET_SHEET_NAME}”sheet")
-
-    worksheet = workbook[BUDGET_SHEET_NAME]
-    headers = [worksheet.cell(row=1, column=idx).value for idx in range(1, 4)]
-    if headers != ["Category", "Amount", "Fixed"]:
-        raise ValueError(f"预算sheet表头不正确: {headers}")
-
-    categories: Dict[str, Dict[str, Any]] = {}
-    for row in worksheet.iter_rows(min_row=2, max_col=3, values_only=True):
-        category_value, amount_value, fixed_value = row
-        if all(value in (None, "") for value in row):
-            continue
-
-        category = str(category_value).strip()
-        if not category:
-            raise ValueError("预算sheet存在空分类")
-        categories[category] = {
-            "amount": _to_budget_decimal(amount_value),
-            "fixed": str(fixed_value).strip().lower() in {"1", "true", "yes", "y", "fixed", "是"} if fixed_value not in (None, "") else False,
-        }
-
-    if not categories:
-        raise ValueError("预算sheet中没有有效预算配置")
-    return categories
-
-
-def resolve_budget_period(envelope: Dict[str, Any]) -> str:
-    timestamp = envelope.get("telegram_timestamp")
-    if timestamp:
-        return time.strftime("%Y-%m", time.localtime(float(timestamp)))
-    return time.strftime("%Y-%m", time.localtime())
-
-
-def format_amount(value: Decimal) -> str:
-    quantized = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if quantized == quantized.to_integral():
-        return str(int(quantized))
-    return format(quantized.normalize(), "f")
-
-
-def display_width(text: str) -> int:
-    width = 0
-    for char in text:
-        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-    return width
-
-
-def pad_display(text: str, target_width: int) -> str:
-    padding = max(target_width - display_width(text), 0)
-    return text + (" " * padding)
-
-
-def build_budget_reply(envelope: Dict[str, Any], excel_path: Path) -> str:
-    budget_config = load_budget_config(excel_path)
-    period = resolve_budget_period(envelope)
-
-    spent_by_category: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    unbudgeted_spent: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-
-    for record in _load_records(excel_path):
-        if record.currency != "CNY" or record.record_type != "支出":
-            continue
-        if record.record_date.strftime("%Y-%m") != period:
-            continue
-
-        if record.category in budget_config:
-            spent_by_category[record.category] += record.amount
-        else:
-            unbudgeted_spent[record.category] += record.amount
-
-    rows: list[tuple[str, str, str, str]] = []
-    total_budget = Decimal("0")
-    total_spent = Decimal("0")
-
-    for category, config in budget_config.items():
-        if config["fixed"]:
-            continue
-
-        budget_amount = config["amount"]
-        spent_amount = spent_by_category.get(category, Decimal("0"))
-        remaining_amount = budget_amount - spent_amount
-        total_budget += budget_amount
-        total_spent += spent_amount
-
-        rows.append(
-            (
-                category,
-                format_amount(budget_amount),
-                format_amount(spent_amount),
-                format_amount(remaining_amount),
-            )
-        )
-
-    total_remaining = total_budget - total_spent
-    rows.append(("合计", format_amount(total_budget), format_amount(total_spent), format_amount(total_remaining)))
-
-    category_width = max(display_width("分类"), *(display_width(row[0]) for row in rows))
-    budget_width = max(display_width("预算"), *(display_width(row[1]) for row in rows))
-    spent_width = max(display_width("已用"), *(display_width(row[2]) for row in rows))
-    remaining_width = max(display_width("剩余"), *(display_width(row[3]) for row in rows))
-
-    lines = [f"{period} 剩余预算", ""]
-    lines.append(
-        f"{pad_display('分类', category_width)}  {pad_display('预算', budget_width)}  {pad_display('已用', spent_width)}  {pad_display('剩余', remaining_width)}"
-    )
-    for category, budget_text, spent_text, remaining_text in rows:
-        lines.append(
-            f"{pad_display(category, category_width)}  {pad_display(budget_text, budget_width)}  {pad_display(spent_text, spent_width)}  {pad_display(remaining_text, remaining_width)}"
-        )
-
-    if unbudgeted_spent:
-        extras = "，".join(
-            f"{category} {format_amount(amount)}"
-            for category, amount in sorted(unbudgeted_spent.items(), key=lambda item: (-item[1], item[0]))
-        )
-        lines.extend(["", f"未设预算支出：{extras}"])
-
-    lines.extend(["", "固定分类项目不在本指令明细中展示。"])
-    return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
-
-
-def classify_network_error(exc: BaseException) -> str:
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"http_{exc.code}"
-    if isinstance(exc, TimeoutError):
-        return "timeout"
-    if isinstance(exc, socket.timeout):
-        return "timeout"
-
-    error_text = str(exc).lower()
-    if "timed out" in error_text:
-        return "timeout"
-    if "eof occurred in violation of protocol" in error_text:
-        return "ssl_eof"
-    if "remote end closed connection without response" in error_text:
-        return "remote_close"
-    if "handshake operation timed out" in error_text:
-        return "tls_handshake_timeout"
-    return "unknown_network_error"
 
 
 def load_state(state_path: Path) -> Dict[str, Any]:
@@ -302,7 +149,7 @@ def load_token(state_path: Path, legacy_token_path: Path | None = None) -> str:
             save_state(state_path, state)
             return legacy_token
 
-    raise ValueError(f"{CONFIG_FILE_NAME} 中缺少 token")
+    raise ValueError("telegram_bot_state.json 中缺少 token")
 
 
 def queue_restart_confirmation(state_path: Path, chat_id: int, reply_to_message_id: int) -> None:
@@ -330,27 +177,18 @@ def send_pending_restart_confirmation(token: str, state_path: Path, verbose: boo
 
     try:
         send_reply(token, chat_id, reply_to_message_id, "机器人已重启完成")
+        state.pop("pending_restart_notice", None)
+        save_state(state_path, state)
+        if verbose:
+            log_json({"stage": "restart_confirmed", "chat_id": chat_id, "reply_to_message_id": reply_to_message_id})
     except Exception as exc:
         if verbose:
-            log_json(
-                {
-                    "stage": "restart_confirmation_failed",
-                    "chat_id": chat_id,
-                    "reply_to_message_id": reply_to_message_id,
-                    "error": str(exc),
-                }
-            )
-        return
-    state.pop("pending_restart_notice", None)
-    save_state(state_path, state)
-    if verbose:
-        log_json({"stage": "restart_confirmed", "chat_id": chat_id, "reply_to_message_id": reply_to_message_id})
+            log_json({"stage": "restart_ack_failed", "message_id": reply_to_message_id, "chat_id": chat_id, "error": str(exc)})
 
 
 def build_message_reference(message: Dict[str, Any] | None) -> Dict[str, Any] | None:
     if not isinstance(message, dict):
         return None
-
     chat = message.get("chat", {}) or {}
     return {
         "message_id": message.get("message_id"),
@@ -411,22 +249,16 @@ def build_record_fingerprint(record: Dict[str, Any]) -> str:
 def register_record_mapping(envelope: Dict[str, Any], result: Dict[str, Any]) -> None:
     chat_id = envelope.get("chat_id")
     message_id = envelope.get("message_id")
-    row = result.get("row")
-    sheet_name = result.get("sheet_name")
     record = result.get("record")
-    if not isinstance(chat_id, int) or not isinstance(message_id, int):
-        return
-    if not isinstance(row, int) or not isinstance(sheet_name, str) or not sheet_name.strip():
-        return
-    if not isinstance(record, dict):
+    if not isinstance(chat_id, int) or not isinstance(message_id, int) or not isinstance(record, dict):
         return
 
     index = load_message_index()
     index[message_index_key(chat_id, message_id)] = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "sheet_name": sheet_name,
-        "row": row,
+        "record_id": record.get("ID"),
+        "sheet_name": result.get("sheet_name"),
         "record_fingerprint": build_record_fingerprint(record),
         "voided": False,
         "created_at": int(time.time()),
@@ -434,11 +266,7 @@ def register_record_mapping(envelope: Dict[str, Any], result: Dict[str, Any]) ->
     save_message_index(index)
 
 
-def invalidate_reply_target(
-    envelope: Dict[str, Any],
-    excel_path: Path,
-    backend: str,
-) -> Dict[str, Any]:
+def invalidate_reply_target(envelope: Dict[str, Any], excel_path: Path, backend: str) -> Dict[str, Any]:
     reply_to_message = envelope.get("reply_to_message")
     if not isinstance(reply_to_message, dict):
         raise ValueError("当前消息没有引用历史消息")
@@ -446,7 +274,7 @@ def invalidate_reply_target(
     chat_id = reply_to_message.get("chat_id")
     message_id = reply_to_message.get("message_id")
     if not isinstance(chat_id, int) or not isinstance(message_id, int):
-        raise ValueError("引用消息缺少有效的 message_id")
+        raise ValueError("引用消息无效")
 
     index = load_message_index()
     key = message_index_key(chat_id, message_id)
@@ -456,43 +284,28 @@ def invalidate_reply_target(
     if entry.get("voided") is True:
         raise ValueError("该记录已作废")
 
-    sheet_name = str(entry.get("sheet_name", "")).strip()
-    row = entry.get("row")
-    if not sheet_name or not isinstance(row, int):
-        raise ValueError("索引记录不完整，无法执行作废")
+    record_id = entry.get("record_id")
+    sheet_name = entry.get("sheet_name")
+    if not record_id:
+        raise ValueError("索引中缺少 Record ID，无法按 ID 定位")
 
-    current_record = read_record_from_excel(excel_path, row=row, sheet_name=sheet_name, backend=backend)
+    current_record = read_record_by_id(excel_path, record_id, sheet_name=sheet_name, backend=backend)
     if str(current_record.get("Status", "")).strip() == VOID_MARK:
         entry["voided"] = True
-        entry["voided_at"] = int(time.time())
         save_message_index(index)
         raise ValueError("该记录已作废")
 
-    current_fingerprint = build_record_fingerprint(current_record)
-    expected_fingerprint = str(entry.get("record_fingerprint", ""))
-    if current_fingerprint != expected_fingerprint:
-        raise ValueError("记录已变化，需要人工确认")
-
-    invalidated_row = invalidate_record_in_excel(excel_path, row=row, sheet_name=sheet_name, backend=backend)
+    invalidated_row = invalidate_record_by_id(excel_path, record_id, sheet_name=sheet_name, backend=backend)
     entry["voided"] = True
     entry["voided_at"] = int(time.time())
     save_message_index(index)
-    return {"row": invalidated_row, "sheet_name": sheet_name, "message_id": message_id}
+    return {"row": invalidated_row, "sheet_name": sheet_name}
 
 
 def run_bridge_prompt(workdir: Path, envelope: Dict[str, Any]) -> str:
     completed = subprocess.run(
-        [
-            "python3",
-            str(workdir / "telegram_codex_bridge.py"),
-            "prompt",
-            "--json",
-            json.dumps(envelope, ensure_ascii=False),
-        ],
-        cwd=workdir,
-        capture_output=True,
-        text=True,
-        check=True,
+        ["python3", str(workdir / "telegram_codex_bridge.py"), "prompt", "--json", json.dumps(envelope, ensure_ascii=False)],
+        cwd=workdir, capture_output=True, text=True, check=True
     )
     output = completed.stdout.strip()
     if not output:
@@ -502,7 +315,6 @@ def run_bridge_prompt(workdir: Path, envelope: Dict[str, Any]) -> str:
 
 def run_gemini(workdir: Path, prompt: str) -> Dict[str, Any]:
     env = os.environ.copy()
-    # 清理 IDE 相关变量以避免无头模式下的 IDEClient 错误
     for key in ["GEMINI_CLI_IDE_SERVER_PORT", "GEMINI_CLI_IDE_AUTH_TOKEN"]:
         env.pop(key, None)
 
@@ -510,46 +322,29 @@ def run_gemini(workdir: Path, prompt: str) -> Dict[str, Any]:
     last_error = ""
     for attempt in range(max_retries):
         completed = subprocess.run(
-            [
-                "gemini",
-                "--prompt",
-                prompt,
-                "--output-format",
-                "json",
-            ],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            env=env,
+            ["gemini", "--prompt", prompt, "--output-format", "json"],
+            cwd=workdir, capture_output=True, text=True, env=env
         )
         if completed.returncode == 0:
             try:
                 outer_json = json.loads(completed.stdout.strip())
                 raw_response = outer_json.get("response", "").strip()
-                
-                if raw_response.startswith("```json"):
-                    raw_response = raw_response[7:].strip()
-                elif raw_response.startswith("```"):
-                    raw_response = raw_response[3:].strip()
-                if raw_response.endswith("```"):
-                    raw_response = raw_response[:-3].strip()
-                    
+                if raw_response.startswith("```json"): raw_response = raw_response[7:].strip()
+                elif raw_response.startswith("```"): raw_response = raw_response[3:].strip()
+                if raw_response.endswith("```"): raw_response = raw_response[:-3].strip()
                 return json.loads(raw_response)
-            except (json.JSONDecodeError, KeyError) as e:
+            except Exception as e:
                 import re
                 match = re.search(r"(\{.*\})", raw_response, re.DOTALL)
                 if match:
-                    try:
-                        return json.loads(match.group(1))
-                    except json.JSONDecodeError:
-                        pass
-                last_error = f"Failed to parse gemini response: {e}"
+                    try: return json.loads(match.group(1))
+                    except: pass
+                last_error = f"Parse failed: {e}"
         else:
-            last_error = (completed.stderr or completed.stdout).strip() or "gemini call failed"
+            last_error = (completed.stderr or completed.stdout).strip() or "gemini failed"
         
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)
-            
     raise RuntimeError(last_error)
 
 
@@ -557,67 +352,33 @@ def run_bridge_apply(workdir: Path, envelope: Dict[str, Any], gemini_output: Dic
     payload = dict(envelope)
     payload["gemini_output"] = gemini_output
     completed = subprocess.run(
-        [
-            "python3",
-            str(workdir / "telegram_codex_bridge.py"),
-            "apply",
-            "--backend",
-            backend,
-            "--excel-path",
-            str(excel_path),
-            "--json",
-            json.dumps(payload, ensure_ascii=False),
-        ],
-        cwd=workdir,
-        capture_output=True,
-        text=True,
-        check=True,
+        ["python3", str(workdir / "telegram_codex_bridge.py"), "apply", "--backend", backend, "--excel-path", str(excel_path), "--json", json.dumps(payload, ensure_ascii=False)],
+        cwd=workdir, capture_output=True, text=True, check=True
     )
     return json.loads(completed.stdout.strip())
 
 
-def send_reply(
-    token: str,
-    chat_id: int,
-    reply_to_message_id: int,
-    text: str,
-    parse_mode: str | None = None,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_to_message_id": reply_to_message_id,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
+def send_reply(token: str, chat_id: int, reply_to_message_id: int, text: str, parse_mode: str | None = None) -> Dict[str, Any]:
+    payload = {"chat_id": chat_id, "text": text, "reply_to_message_id": reply_to_message_id}
+    if parse_mode: payload["parse_mode"] = parse_mode
     return api_request(token, "sendMessage", payload)
 
 
 def trigger_bot_restart(verbose: bool) -> None:
-    subprocess.Popen(
-        ["bash", str(RESTART_SCRIPT_PATH)],
-        cwd=BASE_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    if verbose:
-        log_json({"stage": "restart_triggered", "script": str(RESTART_SCRIPT_PATH)})
+    subprocess.Popen(["bash", str(RESTART_SCRIPT_PATH)], cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+    if verbose: log_json({"stage": "restart_triggered"})
 
 
 def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
-    """当 AI 失效时，生成一条兜底记录"""
     ts = envelope.get("telegram_timestamp")
     if ts:
         local_tm = time.localtime(float(ts))
-        date_str = time.strftime("%Y-%m-%d", local_tm)
-        time_str = time.strftime("%H:%M", local_tm)
+        date_str, time_str = time.strftime("%Y-%m-%d", local_tm), time.strftime("%H:%M", local_tm)
     else:
-        date_str = time.strftime("%Y-%m-%d")
-        time_str = time.strftime("%H:%M")
+        date_str, time_str = time.strftime("%Y-%m-%d"), time.strftime("%H:%M")
 
     return {
+        "ID": f"{envelope.get('chat_id')}:{envelope.get('message_id')}",
         "Date": date_str,
         "Time": time_str,
         "Amount": 0,
@@ -625,245 +386,135 @@ def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "Type": "支出",
         "Category": "未分类",
         "Note": f"[AI失败兜底] {envelope['text']}",
-        "Status": STATUS_PENDING,
+        "Status": "待确认",
     }
 
 
-def handle_message(
-    token: str,
-    workdir: Path,
-    state_path: Path,
-    message: Dict[str, Any],
-    backend: str,
-    excel_path: Path,
-    verbose: bool,
-) -> None:
+def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[str, Any], backend: str, excel_path: Path, verbose: bool) -> None:
     envelope = build_envelope(message)
     if envelope["text"] == "重启":
         queue_restart_confirmation(state_path, envelope["chat_id"], envelope["message_id"])
-        try:
-            send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人")
-        except Exception as exc:
-            if verbose:
-                log_json(
-                    {
-                        "stage": "restart_ack_failed",
-                        "message_id": envelope["message_id"],
-                        "chat_id": envelope["chat_id"],
-                        "error": str(exc),
-                    }
-                )
+        try: send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人")
+        except: pass
         trigger_bot_restart(verbose)
         return
 
-    if envelope["text"] == "预算":
-        send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理预算...")
-        try:
-            reply = build_budget_reply(envelope, excel_path)
-            if verbose:
-                log_json(
-                    {
-                        "stage": "budget_viewed",
-                        "message_id": envelope["message_id"],
-                        "period": resolve_budget_period(envelope),
-                    }
-                )
-        except Exception as exc:
-            if verbose:
-                log_json({"stage": "budget_failed", "message_id": envelope["message_id"], "error": str(exc)})
-            reply = f"预算查询失败：{exc}"
-        send_reply(token, envelope["chat_id"], envelope["message_id"], reply, parse_mode="HTML")
-        return
-
     if envelope["text"] == "作废":
-        if envelope.get("reply_to_message"):
-            result = invalidate_reply_target(envelope, excel_path, backend)
-            if verbose:
-                log_json({"stage": "invalidated_reply", "message_id": envelope["message_id"], "result": result})
-            send_reply(
-                token,
-                envelope["chat_id"],
-                envelope["message_id"],
-                f"已作废对应消息的记录：第 {result['row']} 行（{result['sheet_name']}）",
-            )
-            return
-
-        row = invalidate_last_record_in_excel(excel_path, backend=backend)
-        if verbose:
-            log_json({"stage": "invalidated_last", "message_id": envelope["message_id"], "row": row})
-        send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {row} 行")
+        try:
+            if envelope.get("reply_to_message"):
+                result = invalidate_reply_target(envelope, excel_path, backend)
+                send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废对应消息的记录：第 {result['row']} 行（{result['sheet_name']}）")
+            else:
+                row = invalidate_last_record_in_excel(excel_path, backend=backend)
+                send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {row} 行")
+        except Exception as exc:
+            if verbose: log_json({"stage": "invalidate_error", "message_id": envelope["message_id"], "error": str(exc)})
+            try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"作废失败：{exc}")
+            except: pass
         return
 
-    # 发送“正在处理”消息
-    send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理...")
+    try: send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理...")
+    except: pass
 
+    apply_result = None
+    fallback_used = False
     try:
         try:
             prompt = run_bridge_prompt(workdir, envelope)
             gemini_output = run_gemini(workdir, prompt)
-            result = run_bridge_apply(workdir, envelope, gemini_output, backend, excel_path)
-            fallback_used = False
+            apply_result = run_bridge_apply(workdir, envelope, gemini_output, backend, excel_path)
         except Exception as ai_exc:
-            if verbose:
-                log_json({"stage": "ai_failed_using_fallback", "message_id": envelope["message_id"], "error": str(ai_exc)})
-            
+            if verbose: log_json({"stage": "ai_failed_using_fallback", "message_id": envelope["message_id"], "error": str(ai_exc)})
             record = get_fallback_record(envelope)
             normalized = normalize_record(record)
             sheet_name = record["Date"].split("-")[0]
             row = append_record_to_excel(excel_path, normalized, sheet_name, backend)
-            
-            result = {
-                "ok": True,
-                "record": normalized,
-                "sheet_name": sheet_name,
-                "row": row,
-                "fallback": True,
-                "error_detail": str(ai_exc)
-            }
+            apply_result = {"ok": True, "record": normalized, "sheet_name": sheet_name, "row": row, "fallback": True}
             fallback_used = True
 
-        if verbose:
-            log_json({"stage": "applied", "message_id": envelope["message_id"], "result": result})
-
-        if result.get("ignored"):
-            reply = f"已忽略：{result.get('reason', '不是记账相关消息')}"
-            send_reply(token, envelope["chat_id"], envelope["message_id"], reply)
+        if verbose: log_json({"stage": "applied", "message_id": envelope["message_id"], "result": apply_result})
+        if apply_result.get("ignored"):
+            try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"已忽略：{apply_result.get('reason', '不是记账相关消息')}")
+            except: pass
             return
 
-        register_record_mapping(envelope, result)
+        try: register_record_mapping(envelope, apply_result)
+        except Exception as idx_exc:
+            if verbose: log_json({"stage": "index_error", "message_id": envelope["message_id"], "error": str(idx_exc)})
 
-        note = result["record"]["Note"]
-        amount = result["record"]["Amount"]
-        record_type = result["record"]["Type"]
-        category = result["record"]["Category"]
-        
+        r = apply_result["record"]
         if fallback_used:
-            reply = f"⚠️ AI 处理失败，已为您自动记录原文：\n{record_type} / {category} / {amount}\n备注：{note}\n请稍后手动核对（第 {result['row']} 行）"
+            reply = f"⚠️ AI 处理失败，已为您自动记录原文：\n{r['Type']} / {r['Category']} / {r['Amount']}\n备注：{r['Note']}\n请稍后手动核对（第 {apply_result['row']} 行）"
         else:
-            confirm_hint = "，待确认" if result["record"]["Status"] == STATUS_PENDING else ""
-            reply = f"已记账：{record_type} / {category} / {amount}"
-            if note:
-                reply += f" / {note}"
-            reply += f"，第 {result['row']} 行{confirm_hint}"
+            confirm_hint = "，待确认" if r.get("Status") == STATUS_PENDING else ""
+            reply = f"已记账：{r['Type']} / {r['Category']} / {r['Amount']}"
+            if r['Note']: reply += f" / {r['Note']}"
+            reply += f"，第 {apply_result['row']} 行{confirm_hint}"
         
-        send_reply(token, envelope["chat_id"], envelope["message_id"], reply)
+        try: send_reply(token, envelope["chat_id"], envelope["message_id"], reply)
+        except Exception as reply_exc:
+            if verbose: log_json({"stage": "reply_network_error", "message_id": envelope["message_id"], "error": str(reply_exc)})
     except Exception as exc:
-        error_text = f"系统故障，无法记账：{exc}"
-        if verbose:
-            log_json({"stage": "critical_error", "message_id": message.get("message_id"), "error": str(exc)})
-        send_reply(token, message["chat"]["id"], message["message_id"], error_text)
+        if verbose: log_json({"stage": "critical_error", "message_id": envelope.get("message_id"), "error": str(exc)})
+        try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"系统故障，无法记账：{exc}")
+        except: pass
 
 
-def poll_loop(
-    token: str,
-    workdir: Path,
-    state_path: Path,
-    allowed_username: str,
-    backend: str,
-    excel_path: Path,
-    verbose: bool,
-) -> None:
+def poll_loop(token: str, workdir: Path, state_path: Path, allowed_username: str, backend: str, excel_path: Path, verbose: bool) -> None:
     state = load_state(state_path)
     offset = int(state.get("offset", 0))
-
     while True:
         try:
             refresh_report_if_period_changed(state_path, excel_path, verbose)
             state = load_state(state_path)
             state["offset"] = offset
-            result = api_request(
-                token,
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": API_TIMEOUT_SECONDS,
-                    "allowed_updates": ["message"],
-                },
-                timeout=API_TIMEOUT_SECONDS + 10,
-            )
+            result = api_request(token, "getUpdates", {"offset": offset, "timeout": API_TIMEOUT_SECONDS, "allowed_updates": ["message"]}, timeout=API_TIMEOUT_SECONDS + 10)
             for update in result.get("result", []):
                 update_id = int(update["update_id"])
                 offset = update_id + 1
                 state = load_state(state_path)
                 state["offset"] = offset
                 save_state(state_path, state)
-
                 message = update.get("message")
-                if not message:
-                    continue
-
+                if not message: continue
                 accepted, reason = should_process(message, allowed_username)
-                if verbose:
-                    preview = (message.get("text") or "")[:40]
-                    log_json({"stage": "received", "accepted": accepted, "reason": reason, "text": preview})
-
-                if not accepted:
-                    continue
-
-                try:
-                    handle_message(token, workdir, state_path, message, backend, excel_path, verbose)
-                except Exception as exc:
-                    log_json({"stage": "handle_message_crash", "error": str(exc)})
+                if verbose: log_json({"stage": "received", "accepted": accepted, "reason": reason, "text": (message.get("text") or "")[:40]})
+                if not accepted: continue
+                try: handle_message(token, workdir, state_path, message, backend, excel_path, verbose)
+                except Exception as exc: log_json({"stage": "handle_message_crash", "error": str(exc)})
         except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                if verbose:
-                    log_json(
-                        {
-                            "stage": "fatal_auth_error",
-                            "error_type": classify_network_error(exc),
-                            "error": f"HTTP Error {exc.code}: {exc.reason}",
-                        }
-                    )
-                raise RuntimeError("Telegram bot token unauthorized; exiting daemon") from exc
-            if verbose:
-                log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
+            if exc.code == 401: raise RuntimeError("Unauthorized bot token") from exc
+            if verbose: log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
             time.sleep(5)
         except urllib.error.URLError as exc:
-            if verbose:
-                log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
+            if verbose: log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
             time.sleep(5)
         except Exception as exc:
-            if verbose:
-                log_json({"stage": "loop_error", "error_type": classify_network_error(exc), "error": str(exc)})
+            if verbose: log_json({"stage": "loop_error", "error_type": classify_network_error(exc), "error": str(exc)})
             time.sleep(5)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Telegram expense bot daemon.")
+def main() -> int:
+    parser = argparse.ArgumentParser()
     parser.add_argument("--state-file", default=str(BASE_DIR / CONFIG_FILE_NAME))
     parser.add_argument("--legacy-token-file", default=str(BASE_DIR / "bot_token.txt"))
     parser.add_argument("--excel-path", default="")
     parser.add_argument("--backend", choices=["win32com", "openpyxl"], default="openpyxl")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    return parser
-
-
-def main() -> int:
-    parser = build_parser()
     args = parser.parse_args()
-
     workdir = BASE_DIR
     state_path = Path(args.state_file)
     state = load_state(state_path)
     excel_path = Path(args.excel_path) if str(args.excel_path).strip() else configured_excel_path(state)
-    allowed_username = configured_allowed_username(state)
     token = load_token(state_path, Path(args.legacy_token_file))
-
     me = api_request(token, "getMe")
-    if args.verbose:
-        log_json({"stage": "getMe", "result": me["result"]})
-
+    if args.verbose: log_json({"stage": "getMe", "result": me["result"]})
     send_pending_restart_confirmation(token, state_path, args.verbose)
-
-    if args.once:
-        log_json({"ok": True, "bot": me["result"], "allowed_username_configured": bool(allowed_username), "excel_path": str(excel_path)})
-        return 0
-
+    if args.once: return 0
     refresh_report_if_period_changed(state_path, excel_path, args.verbose)
-    poll_loop(token, workdir, state_path, allowed_username, args.backend, excel_path, args.verbose)
+    poll_loop(token, workdir, state_path, configured_allowed_username(state), args.backend, excel_path, args.verbose)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

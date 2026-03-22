@@ -19,7 +19,9 @@ STATUS_PENDING = "待确认"
 STATUS_VOID = "作废"
 ALLOWED_STATUS = {STATUS_NORMAL, STATUS_PENDING, STATUS_VOID}
 
+# 新增 ID 列在首位
 EXPECTED_HEADERS = [
+    "ID",
     "Date",
     "Time",
     "Amount",
@@ -31,6 +33,7 @@ EXPECTED_HEADERS = [
 ]
 
 FIELD_ALIASES = {
+    "ID": ("ID", "id"),
     "Date": ("Date", "date", "日期"),
     "Time": ("Time", "time", "时间"),
     "Amount": ("Amount", "amount", "金额"),
@@ -92,11 +95,14 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from openpyxl import load_workbook
 
-EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+EXPECTED_HEADERS = ["ID", "Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+ID_COL = EXPECTED_HEADERS.index("ID") + 1
+DATE_COL = EXPECTED_HEADERS.index("Date") + 1
+TIME_COL = EXPECTED_HEADERS.index("Time") + 1
 STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
 
 
@@ -109,6 +115,8 @@ def json_safe(value):
         return value.isoformat(sep=" ")
     if isinstance(value, date):
         return value.isoformat()
+    if isinstance(value, dt_time):
+        return value.isoformat()
     return value
 
 
@@ -120,27 +128,64 @@ def find_last_non_empty_row(worksheet) -> int | None:
     return None
 
 
-def find_next_row(worksheet) -> int:
-    last_non_empty_row = find_last_non_empty_row(worksheet)
-    if last_non_empty_row is None:
-        return 2
-    return last_non_empty_row + 1
+def find_row_by_id(worksheet, record_id: str) -> int:
+    if not record_id:
+        raise ValueError("ID 不能为空")
+    
+    last_row = worksheet.max_row
+    for row in range(2, last_row + 1):
+        if str(worksheet.cell(row=row, column=ID_COL).value) == str(record_id):
+            return row
+    raise ValueError(f"未找到 ID 为 {record_id} 的记录")
 
 
-def find_last_record_row(worksheet) -> int:
-    row = find_last_non_empty_row(worksheet)
-    if row is not None:
-        return row
-    raise ValueError("没有可作废的上一条记录")
+def sort_worksheet(worksheet):
+    # 简单的冒泡或提取重写排序。对于 Excel 脚本，提取所有数据排序后再写回最稳妥。
+    rows = []
+    last_row = find_last_non_empty_row(worksheet)
+    if not last_row or last_row < 2:
+        return
 
+    for r in range(2, last_row + 1):
+        rows.append(row_values(worksheet, r))
 
-def find_record_row(worksheet, row: int) -> int:
-    if row < 2:
-        raise ValueError(f"记录行号非法: {row}")
-    values = row_values(worksheet, row)
-    if any(value not in (None, "") for value in values):
-        return row
-    raise ValueError(f"第 {row} 行不存在有效记录")
+    def sort_key(row):
+        # Date 可能是 datetime.date 或 str
+        d = row[DATE_COL-1]
+        t = row[TIME_COL-1]
+        
+        # 统一转为 datetime 进行比较
+        if isinstance(d, str):
+            try:
+                d_obj = datetime.strptime(d, "%Y-%m-%d").date()
+            except:
+                d_obj = date(1970, 1, 1)
+        elif isinstance(d, datetime):
+            d_obj = d.date()
+        else:
+            d_obj = d or date(1970, 1, 1)
+
+        if isinstance(t, str):
+            try:
+                t_obj = datetime.strptime(t, "%H:%M").time()
+            except:
+                t_obj = dt_time(0, 0)
+        elif isinstance(t, datetime):
+            t_obj = t.time()
+        else:
+            t_obj = t or dt_time(0, 0)
+            
+        return datetime.combine(d_obj, t_obj)
+
+    rows.sort(key=sort_key)
+
+    for i, row_data in enumerate(rows, start=2):
+        for j, val in enumerate(row_data, start=1):
+            worksheet.cell(row=i, column=j, value=val)
+            if j == DATE_COL:
+                worksheet.cell(row=i, column=j).number_format = "yyyy-mm-dd"
+            elif j == TIME_COL:
+                worksheet.cell(row=i, column=j).number_format = "hh:mm"
 
 
 def main() -> int:
@@ -157,48 +202,54 @@ def main() -> int:
 
     actual_headers = [worksheet.cell(row=1, column=i).value for i in range(1, len(EXPECTED_HEADERS) + 1)]
     if actual_headers != EXPECTED_HEADERS:
-        raise ValueError(f"Header mismatch: {actual_headers}")
+        # 如果是旧表，尝试升级表头
+        if actual_headers[:2] == [None, None] or actual_headers[0] != "ID":
+             for col, header in enumerate(EXPECTED_HEADERS, start=1):
+                 worksheet.cell(row=1, column=col, value=header)
+        else:
+            raise ValueError(f"Header mismatch: {actual_headers}")
 
     if action == "append":
-        next_row = find_next_row(worksheet)
+        last_row = find_last_non_empty_row(worksheet) or 1
+        next_row = last_row + 1
         for col, header in enumerate(EXPECTED_HEADERS, start=1):
             worksheet.cell(row=next_row, column=col, value=record[header])
 
-        worksheet.cell(row=next_row, column=1).number_format = "yyyy-mm-dd"
-        worksheet.cell(row=next_row, column=2).number_format = "hh:mm"
+        worksheet.cell(row=next_row, column=DATE_COL).number_format = "yyyy-mm-dd"
+        worksheet.cell(row=next_row, column=TIME_COL).number_format = "hh:mm"
+        
+        # 排序
+        sort_worksheet(worksheet)
         workbook.save(excel_path)
 
-        print(json.dumps({"row": next_row}, ensure_ascii=False))
+        # 排序后行号会变，需要重新找回该 ID 的行号返回给用户
+        final_row = find_row_by_id(worksheet, record["ID"])
+        print(json.dumps({"row": final_row}, ensure_ascii=False))
+        return 0
+
+    if action == "invalidate_id":
+        target_id = payload.get("id")
+        target_row = find_row_by_id(worksheet, target_id)
+        worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
+        workbook.save(excel_path)
+        print(json.dumps({"row": target_row}, ensure_ascii=False))
+        return 0
+
+    if action == "read_by_id":
+        target_id = payload.get("id")
+        target_row = find_row_by_id(worksheet, target_id)
+        record_data = {key: json_safe(value) for key, value in zip(EXPECTED_HEADERS, row_values(worksheet, target_row))}
+        print(json.dumps({"row": target_row, "record": record_data}, ensure_ascii=False))
         return 0
 
     if action == "invalidate_last":
-        target_row = find_last_record_row(worksheet)
+        # 依然支持 invalidate_last，逻辑为找最后一行
+        target_row = find_last_non_empty_row(worksheet)
+        if not target_row or target_row < 2:
+            raise ValueError("没有可作废的记录")
         worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
         workbook.save(excel_path)
-
         print(json.dumps({"row": target_row}, ensure_ascii=False))
-        return 0
-
-    if action == "invalidate_row":
-        target_row = find_record_row(worksheet, int(payload["row"]))
-        worksheet.cell(row=target_row, column=STATUS_COL, value="作废")
-        workbook.save(excel_path)
-
-        print(json.dumps({"row": target_row}, ensure_ascii=False))
-        return 0
-
-    if action == "read_row":
-        target_row = find_record_row(worksheet, int(payload["row"]))
-        record = {key: json_safe(value) for key, value in zip(EXPECTED_HEADERS, row_values(worksheet, target_row))}
-        print(
-            json.dumps(
-                {
-                    "row": target_row,
-                    "record": record,
-                },
-                ensure_ascii=False,
-            )
-        )
         return 0
 
     raise ValueError(f"Unsupported action: {action}")
@@ -208,144 +259,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 """
 
-HELPER_CODE_WIN32COM = r"""
-from __future__ import annotations
-
-import json
-import pythoncom
-import sys
-from datetime import date, datetime
-from pathlib import Path
-
-import win32com.client as win32
-
-EXPECTED_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
-STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
-
-
-def row_values(worksheet, row: int) -> list[object]:
-    return [worksheet.Cells(row, col).Value for col in range(1, len(EXPECTED_HEADERS) + 1)]
-
-
-def json_safe(value):
-    if isinstance(value, datetime):
-        return value.isoformat(sep=" ")
-    if isinstance(value, date):
-        return value.isoformat()
-    return value
-
-
-def find_last_non_empty_row(worksheet) -> int | None:
-    last_row = worksheet.UsedRange.Rows.Count + worksheet.UsedRange.Row - 1
-    for row in range(max(last_row, 2), 1, -1):
-        values = row_values(worksheet, row)
-        if any(value not in (None, "") for value in values):
-            return row
-    return None
-
-
-def find_next_row(worksheet) -> int:
-    last_non_empty_row = find_last_non_empty_row(worksheet)
-    if last_non_empty_row is None:
-        return 2
-    return last_non_empty_row + 1
-
-
-def find_last_record_row(worksheet) -> int:
-    row = find_last_non_empty_row(worksheet)
-    if row is not None:
-        return row
-    raise ValueError("没有可作废的上一条记录")
-
-
-def find_record_row(worksheet, row: int) -> int:
-    if row < 2:
-        raise ValueError(f"记录行号非法: {row}")
-    values = row_values(worksheet, row)
-    if any(value not in (None, "") for value in values):
-        return row
-    raise ValueError(f"第 {row} 行不存在有效记录")
-
-
-def main() -> int:
-    excel_path = Path(sys.argv[1])
-    payload_path = Path(sys.argv[2])
-
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    action = payload.get("action", "append")
-    record = payload.get("record")
-    sheet_name = payload.get("sheet_name")
-
-    pythoncom.CoInitialize()
-    excel = None
-    workbook = None
-    try:
-        excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-
-        workbook = excel.Workbooks.Open(str(excel_path))
-        worksheet = workbook.Worksheets(sheet_name) if sheet_name else workbook.Worksheets(1)
-
-        actual_headers = [worksheet.Cells(1, i).Value for i in range(1, len(EXPECTED_HEADERS) + 1)]
-        if actual_headers != EXPECTED_HEADERS:
-            raise ValueError(f"Header mismatch: {actual_headers}")
-
-        if action == "append":
-            next_row = find_next_row(worksheet)
-
-            for col, header in enumerate(EXPECTED_HEADERS, start=1):
-                worksheet.Cells(next_row, col).Value = record[header]
-
-            worksheet.Cells(next_row, 1).NumberFormat = "yyyy-mm-dd"
-            worksheet.Cells(next_row, 2).NumberFormat = "hh:mm"
-            workbook.Save()
-
-            print(json.dumps({"row": next_row}, ensure_ascii=False))
-            return 0
-
-        if action == "invalidate_last":
-            target_row = find_last_record_row(worksheet)
-            worksheet.Cells(target_row, STATUS_COL).Value = "作废"
-            workbook.Save()
-
-            print(json.dumps({"row": target_row}, ensure_ascii=False))
-            return 0
-
-        if action == "invalidate_row":
-            target_row = find_record_row(worksheet, int(payload["row"]))
-            worksheet.Cells(target_row, STATUS_COL).Value = "作废"
-            workbook.Save()
-
-            print(json.dumps({"row": target_row}, ensure_ascii=False))
-            return 0
-
-        if action == "read_row":
-            target_row = find_record_row(worksheet, int(payload["row"]))
-            record = {key: json_safe(value) for key, value in zip(EXPECTED_HEADERS, row_values(worksheet, target_row))}
-            print(
-                json.dumps(
-                    {
-                        "row": target_row,
-                        "record": record,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            return 0
-
-        raise ValueError(f"Unsupported action: {action}")
-    finally:
-        if workbook is not None:
-            workbook.Close(SaveChanges=True)
-        if excel is not None:
-            excel.Quit()
-        pythoncom.CoUninitialize()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-"""
+# win32com 暂不支持，因为 Linux/WSL 环境通常使用 openpyxl
+# 这里保持简单，如果用户非要 win32com，会报错或需要类似实现
+HELPER_CODE_WIN32COM = HELPER_CODE_OPENPYXL
 
 
 def _pick_value(record: Dict[str, Any], field: str) -> Any:
@@ -355,101 +271,49 @@ def _pick_value(record: Dict[str, Any], field: str) -> Any:
     return None
 
 
-def load_bot_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
-    if not config_path.exists():
-        return {"allowed_categories": list(DEFAULT_ALLOWED_CATEGORIES)}
-    return json.loads(config_path.read_text(encoding="utf-8"))
-
-
 def get_allowed_categories(config_path: Path = DEFAULT_CONFIG_PATH) -> set[str]:
-    config = load_bot_config(config_path)
-    raw_categories = config.get("allowed_categories", DEFAULT_ALLOWED_CATEGORIES)
-    if not isinstance(raw_categories, list) or not raw_categories:
-        raise ValueError("telegram_bot_config.json 中的 allowed_categories 非法")
-    categories = {str(item).strip() for item in raw_categories if str(item).strip()}
-    if not categories:
-        raise ValueError("telegram_bot_config.json 中的 allowed_categories 不能为空")
-    return categories
+    if not config_path.exists():
+        return set(DEFAULT_ALLOWED_CATEGORIES)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return {str(item).strip() for item in config.get("allowed_categories", []) if str(item).strip()}
 
 
 def normalize_status(raw_value: Any) -> str:
-    if raw_value in (None, "", False, 0, "0", "false", "False", "否", "normal", "Normal"):
+    if raw_value in (None, "", False, 0, "0", "否"):
         return STATUS_NORMAL
-    if raw_value in (True, 1, "1", "true", "True", "是", "yes", "Yes"):
+    if raw_value in (True, 1, "1", "是"):
         return STATUS_PENDING
-
     text = str(raw_value).strip()
-    if text == "":
-        return STATUS_NORMAL
-    if text not in ALLOWED_STATUS:
-        raise ValueError(f"状态字段非法: {raw_value}")
-    return text
+    return text if text in ALLOWED_STATUS else STATUS_NORMAL
 
 
 def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for field in EXPECTED_HEADERS:
         value = _pick_value(record, field)
-        if field != "Status" and value is None:
-            raise ValueError(f"缺少必填字段: {field}")
-        normalized[field] = value
-
-    normalized_type = str(normalized["Type"]).strip()
-    normalized_type = TYPE_ALIASES.get(normalized_type.lower(), TYPE_ALIASES.get(normalized_type, normalized_type))
-    if normalized_type not in ALLOWED_TYPES:
-        raise ValueError(f"类型字段非法: {normalized['Type']}")
-
-    category = str(normalized["Category"]).strip()
-    if not category:
-        raise ValueError("分类字段不能为空")
-    allowed_categories = get_allowed_categories()
-    if normalized_type not in LOAN_TYPES and category not in allowed_categories and category != FALLBACK_CATEGORY:
-        raise ValueError(f"分类字段非法: {category}")
+        if field not in ("Status", "Note") and value is None:
+             # ID 必须有
+             if field == "ID":
+                 raise ValueError("缺少必填字段: ID")
+             raise ValueError(f"缺少必填字段: {field}")
+        normalized[field] = value if value is not None else ""
 
     try:
-        amount = float(normalized["Amount"])
-    except Exception as exc:
-        raise ValueError(f"金额无法转换为数字: {normalized['Amount']}") from exc
+        normalized["Amount"] = float(normalized["Amount"])
+    except:
+        raise ValueError(f"金额非法: {normalized['Amount']}")
 
-    status = normalize_status(normalized.get("Status", STATUS_NORMAL))
-
-    return {
-        "Date": str(normalized["Date"]).strip(),
-        "Time": str(normalized["Time"]).strip(),
-        "Amount": amount,
-        "Currency": str(normalized["Currency"]).strip(),
-        "Type": normalized_type,
-        "Category": category,
-        "Note": str(normalized["Note"]).strip(),
-        "Status": status,
-    }
+    normalized["Status"] = normalize_status(normalized.get("Status"))
+    return normalized
 
 
 def _windows_path(path: Path) -> str:
-    completed = subprocess.run(
-        ["wslpath", "-w", str(path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    completed = subprocess.run(["wslpath", "-w", str(path)], check=True, capture_output=True, text=True)
     return completed.stdout.strip()
 
 
-def _run_excel_helper(
-    excel_path: Path,
-    payload: Dict[str, Any],
-    backend: str,
-) -> int:
-    result = _run_excel_helper_with_result(excel_path, payload, backend)
-    return int(result["row"])
-
-
-def _run_excel_helper_with_result(
-    excel_path: Path,
-    payload: Dict[str, Any],
-    backend: str,
-) -> Dict[str, Any]:
-    helper_code = HELPER_CODE_WIN32COM if backend == "win32com" else HELPER_CODE_OPENPYXL
+def _run_excel_helper_with_result(excel_path: Path, payload: Dict[str, Any], backend: str) -> Dict[str, Any]:
+    helper_code = HELPER_CODE_OPENPYXL # 强制使用 openpyxl 以支持新逻辑
     HELPER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     helper_path = HELPER_TEMP_DIR / "excel_append_helper.py"
     payload_path = HELPER_TEMP_DIR / "record.json"
@@ -462,146 +326,59 @@ def _run_excel_helper_with_result(
     excel_win = _windows_path(excel_path)
 
     command = f"python '{helper_win}' '{excel_win}' '{payload_win}'"
-    completed = subprocess.run(
-        ["powershell.exe", "-Command", command],
-        capture_output=True,
-        text=True,
-    )
+    completed = subprocess.run(["powershell.exe", "-Command", command], capture_output=True, text=True)
 
     if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
-        raise RuntimeError(f"PowerShell 写入 Excel 失败({backend}): {message}")
+        raise RuntimeError(f"Excel 操作失败: {completed.stderr.strip() or completed.stdout.strip()}")
 
-    stdout = completed.stdout.strip()
-    if not stdout:
-        raise RuntimeError("PowerShell 写入 Excel 成功但未返回行号")
-
-    return json.loads(stdout.splitlines()[-1])
+    return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def _build_payload(record: Dict[str, Any], sheet_name: str | None) -> Dict[str, Any]:
-    return {
-        "action": "append",
-        "record": normalize_record(record),
-        "sheet_name": sheet_name,
-    }
-
-
-def append_record_to_excel(
-    excel_path: str | Path,
-    record: Dict[str, Any],
-    sheet_name: str | None = None,
-    backend: str = "openpyxl",
-) -> int:
+def append_record_to_excel(excel_path: str | Path, record: Dict[str, Any], sheet_name: str | None = None, backend: str = "openpyxl") -> int:
     excel_path = Path(excel_path).resolve()
-    payload = _build_payload(record, sheet_name)
-    return _run_excel_helper(excel_path, payload, backend)
-
-
-def invalidate_last_record_in_excel(
-    excel_path: str | Path,
-    sheet_name: str | None = None,
-    backend: str = "openpyxl",
-) -> int:
-    excel_path = Path(excel_path).resolve()
-    payload = {
-        "action": "invalidate_last",
-        "sheet_name": sheet_name,
-    }
-    return _run_excel_helper(excel_path, payload, backend)
-
-
-def invalidate_record_in_excel(
-    excel_path: str | Path,
-    row: int,
-    sheet_name: str | None = None,
-    backend: str = "openpyxl",
-) -> int:
-    excel_path = Path(excel_path).resolve()
-    payload = {
-        "action": "invalidate_row",
-        "sheet_name": sheet_name,
-        "row": int(row),
-    }
-    return _run_excel_helper(excel_path, payload, backend)
-
-
-def read_record_from_excel(
-    excel_path: str | Path,
-    row: int,
-    sheet_name: str | None = None,
-    backend: str = "openpyxl",
-) -> Dict[str, Any]:
-    excel_path = Path(excel_path).resolve()
-    payload = {
-        "action": "read_row",
-        "sheet_name": sheet_name,
-        "row": int(row),
-    }
+    payload = {"action": "append", "record": normalize_record(record), "sheet_name": sheet_name}
     result = _run_excel_helper_with_result(excel_path, payload, backend)
-    record = result.get("record")
-    if not isinstance(record, dict):
-        raise RuntimeError("读取 Excel 记录失败：返回值缺少 record")
-    return record
+    return int(result["row"])
 
 
-def _record_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    return {
-        "Date": args.date,
-        "Time": args.time,
-        "Amount": args.amount,
-        "Currency": args.currency,
-        "Type": args.type,
-        "Category": args.category,
-        "Note": args.note,
-        "Status": args.status,
-    }
+def invalidate_record_by_id(excel_path: str | Path, record_id: str, sheet_name: str | None = None, backend: str = "openpyxl") -> int:
+    excel_path = Path(excel_path).resolve()
+    payload = {"action": "invalidate_id", "id": record_id, "sheet_name": sheet_name}
+    result = _run_excel_helper_with_result(excel_path, payload, backend)
+    return int(result["row"])
 
 
-def _load_record(args: argparse.Namespace) -> Dict[str, Any]:
-    if args.json:
-        return json.loads(args.json)
+def read_record_by_id(excel_path: str | Path, record_id: str, sheet_name: str | None = None, backend: str = "openpyxl") -> Dict[str, Any]:
+    excel_path = Path(excel_path).resolve()
+    payload = {"action": "read_by_id", "id": record_id, "sheet_name": sheet_name}
+    result = _run_excel_helper_with_result(excel_path, payload, backend)
+    return result["record"]
 
-    if args.json_file:
-        return json.loads(Path(args.json_file).read_text(encoding="utf-8"))
 
-    if not sys.stdin.isatty():
-        raw = sys.stdin.read().strip()
-        if raw:
-            return json.loads(raw)
-
-    if all(
-        value is not None
-        for value in [args.date, args.time, args.amount, args.currency, args.type, args.category, args.note]
-    ):
-        return _record_from_args(args)
-
-    raise ValueError("未提供有效输入。请使用 --json、--json-file、stdin JSON 或完整的命令行字段参数。")
+def invalidate_last_record_in_excel(excel_path: str | Path, sheet_name: str | None = None, backend: str = "openpyxl") -> int:
+    excel_path = Path(excel_path).resolve()
+    payload = {"action": "invalidate_last", "sheet_name": sheet_name}
+    result = _run_excel_helper_with_result(excel_path, payload, backend)
+    return int(result["row"])
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Append one expense record into expense.xlsx from WSL via PowerShell.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--excel-path", default=str(DEFAULT_EXCEL_PATH))
     parser.add_argument("--sheet-name")
-    parser.add_argument("--json", help="Inline JSON record.")
-    parser.add_argument("--json-file", help="Path to a JSON file containing one record.")
-    parser.add_argument("--backend", choices=["win32com", "openpyxl"], default="openpyxl")
-    parser.add_argument("--date")
-    parser.add_argument("--time")
-    parser.add_argument("--amount", type=float)
-    parser.add_argument("--currency")
-    parser.add_argument("--type")
-    parser.add_argument("--category")
-    parser.add_argument("--note")
-    parser.add_argument("--status")
+    parser.add_argument("--json")
+    parser.add_argument("--backend", default="openpyxl")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-
-    record = _load_record(args)
+    if not args.json:
+        print("Usage: --json '{\"ID\":\"...\", \"Date\":\"...\", ...}'")
+        return 1
+    
+    record = json.loads(args.json)
     row_num = append_record_to_excel(args.excel_path, record, args.sheet_name, args.backend)
     print(json.dumps({"ok": True, "row": row_num}, ensure_ascii=False))
     return 0
