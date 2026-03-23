@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,34 @@ PROJECT_DIR = BASE_DIR.parent
 RESTART_SCRIPT_PATH = BASE_DIR / "restart_bot.sh"
 VOID_MARK = "作废"
 CONFIG_FILE_NAME = "telegram_bot_state.json"
+CODEX_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["ignored", "reason", "record"],
+    "properties": {
+        "ignored": {"type": "boolean"},
+        "reason": {"type": "string"},
+        "record": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["ID", "Date", "Time", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
+            "properties": {
+                "ID": {"type": "string"},
+                "Date": {"type": "string"},
+                "Time": {"type": "string"},
+                "DateProvided": {"type": "boolean"},
+                "TimeProvided": {"type": "boolean"},
+                "Amount": {"type": "number"},
+                "Currency": {"type": "string"},
+                "Type": {"type": "string", "enum": ["收入", "支出", "借入", "贷出", "收回", "偿还"]},
+                "Category": {"type": "string"},
+                "Note": {"type": "string"},
+                "Status": {"type": "string"},
+            },
+        },
+    },
+}
 
 
 def classify_network_error(exc: Exception) -> str:
@@ -53,7 +82,6 @@ def get_monthly_file_path(base_name: str, ext: str) -> Path:
 
 def log_json(payload: Dict[str, Any]) -> None:
     payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
     log_file = get_monthly_file_path("logs", "log")
     try:
         with log_file.open("a", encoding="utf-8") as f:
@@ -313,7 +341,7 @@ def run_bridge_prompt(workdir: Path, envelope: Dict[str, Any]) -> str:
     return output
 
 
-def run_gemini(workdir: Path, prompt: str) -> Dict[str, Any]:
+def run_codex(workdir: Path, prompt: str) -> Dict[str, Any]:
     env = os.environ.copy()
     for key in ["GEMINI_CLI_IDE_SERVER_PORT", "GEMINI_CLI_IDE_AUTH_TOKEN"]:
         env.pop(key, None)
@@ -321,36 +349,53 @@ def run_gemini(workdir: Path, prompt: str) -> Dict[str, Any]:
     max_retries = 3
     last_error = ""
     for attempt in range(max_retries):
-        completed = subprocess.run(
-            ["gemini", "--prompt", prompt, "--output-format", "json"],
-            cwd=workdir, capture_output=True, text=True, env=env
-        )
-        if completed.returncode == 0:
-            try:
-                outer_json = json.loads(completed.stdout.strip())
-                raw_response = outer_json.get("response", "").strip()
-                if raw_response.startswith("```json"): raw_response = raw_response[7:].strip()
-                elif raw_response.startswith("```"): raw_response = raw_response[3:].strip()
-                if raw_response.endswith("```"): raw_response = raw_response[:-3].strip()
-                return json.loads(raw_response)
-            except Exception as e:
-                import re
-                match = re.search(r"(\{.*\})", raw_response, re.DOTALL)
-                if match:
-                    try: return json.loads(match.group(1))
-                    except: pass
-                last_error = f"Parse failed: {e}"
-        else:
-            last_error = (completed.stderr or completed.stdout).strip() or "gemini failed"
-        
+        with tempfile.TemporaryDirectory(prefix="codex-expense-") as temp_dir:
+            temp_path = Path(temp_dir)
+            schema_path = temp_path / "codex_output_schema.json"
+            output_path = temp_path / "codex_output.json"
+            schema_path.write_text(json.dumps(CODEX_OUTPUT_SCHEMA, ensure_ascii=False), encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--sandbox",
+                    "read-only",
+                    "--color",
+                    "never",
+                    "--output-schema",
+                    str(schema_path),
+                    "-o",
+                    str(output_path),
+                    "-",
+                ],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                env=env,
+                input=prompt,
+            )
+            if completed.returncode == 0:
+                raw_output = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
+                if raw_output:
+                    try:
+                        return json.loads(raw_output)
+                    except Exception as exc:
+                        last_error = f"Parse failed: {exc}"
+                else:
+                    last_error = "codex output is empty"
+            else:
+                last_error = (completed.stderr or completed.stdout).strip() or "codex failed"
+
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)
     raise RuntimeError(last_error)
 
 
-def run_bridge_apply(workdir: Path, envelope: Dict[str, Any], gemini_output: Dict[str, Any], backend: str, excel_path: Path) -> Dict[str, Any]:
+def run_bridge_apply(workdir: Path, envelope: Dict[str, Any], codex_output: Dict[str, Any], backend: str, excel_path: Path) -> Dict[str, Any]:
     payload = dict(envelope)
-    payload["gemini_output"] = gemini_output
+    payload["codex_output"] = codex_output
     completed = subprocess.run(
         ["python3", str(workdir / "telegram_codex_bridge.py"), "apply", "--backend", backend, "--excel-path", str(excel_path), "--json", json.dumps(payload, ensure_ascii=False)],
         cwd=workdir, capture_output=True, text=True, check=True
@@ -421,8 +466,8 @@ def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[st
     try:
         try:
             prompt = run_bridge_prompt(workdir, envelope)
-            gemini_output = run_gemini(workdir, prompt)
-            apply_result = run_bridge_apply(workdir, envelope, gemini_output, backend, excel_path)
+            codex_output = run_codex(workdir, prompt)
+            apply_result = run_bridge_apply(workdir, envelope, codex_output, backend, excel_path)
         except Exception as ai_exc:
             if verbose: log_json({"stage": "ai_failed_using_fallback", "message_id": envelope["message_id"], "error": str(ai_exc)})
             record = get_fallback_record(envelope)

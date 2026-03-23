@@ -1,6 +1,6 @@
 # Telegram Expense Bot
 
-这个项目会轮询 Telegram Bot API，把白名单用户发来的文本消息交给 Gemini 判断是否属于记账内容；如果是，就写入 `expense.xlsx`，否则回复忽略提示。
+这个项目会轮询 Telegram Bot API，把白名单用户发来的文本消息交给 Codex 判断是否属于记账内容；如果是，就写入 `expense.xlsx`，否则回复忽略提示。
 
 ## 项目结构
 
@@ -36,7 +36,7 @@
 
 ## 当前行为
 
-- **智能判断**：白名单用户发来的文本都会交给 Gemini 处理。
+- **智能判断**：白名单用户发来的文本都会交给 Codex 处理。
 - **快捷指令**：
     - `重启`：直接触发重启脚本，完成后尝试发送确认。
     - `作废`：支持直接回复某条记录进行精确作废，或作废上一条记录。
@@ -62,5 +62,5 @@ tail -f bot_runtime/logs/$(date +"%Y-%m").log
 
 ## 依赖
 
-- **WSL/Linux**: `python3`, `gemini` CLI (已登录)
+- **WSL/Linux**: `python3`, `codex` CLI (已登录)
 - **Windows**: `python`, `openpyxl`
