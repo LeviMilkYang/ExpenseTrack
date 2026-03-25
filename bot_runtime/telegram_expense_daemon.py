@@ -17,7 +17,6 @@ from append_excel_entry import (
     EXPECTED_HEADERS,
     STATUS_PENDING,
     append_record_to_excel,
-    invalidate_last_record_in_excel,
     invalidate_record_by_id,
     normalize_record,
     read_record_by_id,
@@ -294,21 +293,47 @@ def register_record_mapping(envelope: Dict[str, Any], result: Dict[str, Any]) ->
     save_message_index(index)
 
 
-def invalidate_reply_target(envelope: Dict[str, Any], excel_path: Path, backend: str) -> Dict[str, Any]:
+def _resolve_invalidate_target(index: Dict[str, Any], envelope: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    chat_id = envelope.get("chat_id")
+    current_message_id = envelope.get("message_id")
+    if not isinstance(chat_id, int) or not isinstance(current_message_id, int):
+        raise ValueError("当前消息缺少有效的 chat_id 或 message_id")
+
     reply_to_message = envelope.get("reply_to_message")
-    if not isinstance(reply_to_message, dict):
-        raise ValueError("当前消息没有引用历史消息")
+    if isinstance(reply_to_message, dict):
+        target_chat_id = reply_to_message.get("chat_id")
+        target_message_id = reply_to_message.get("message_id")
+        if not isinstance(target_chat_id, int) or not isinstance(target_message_id, int):
+            raise ValueError("引用消息无效")
+        key = message_index_key(target_chat_id, target_message_id)
+        entry = index.get(key)
+        if not isinstance(entry, dict):
+            raise ValueError("这条消息没有对应账本记录")
+        return key, entry
 
-    chat_id = reply_to_message.get("chat_id")
-    message_id = reply_to_message.get("message_id")
-    if not isinstance(chat_id, int) or not isinstance(message_id, int):
-        raise ValueError("引用消息无效")
+    candidates: list[tuple[int, str, Dict[str, Any]]] = []
+    for key, entry in index.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("chat_id") != chat_id:
+            continue
+        message_id = entry.get("message_id")
+        if not isinstance(message_id, int):
+            continue
+        if message_id >= current_message_id:
+            continue
+        candidates.append((message_id, key, entry))
 
+    if not candidates:
+        raise ValueError("当前消息之前没有可作废的账本记录")
+
+    _, key, entry = max(candidates, key=lambda item: item[0])
+    return key, entry
+
+
+def invalidate_target_record(envelope: Dict[str, Any], excel_path: Path, backend: str) -> Dict[str, Any]:
     index = load_message_index()
-    key = message_index_key(chat_id, message_id)
-    entry = index.get(key)
-    if not isinstance(entry, dict):
-        raise ValueError("这条消息没有对应账本记录")
+    key, entry = _resolve_invalidate_target(index, envelope)
     if entry.get("voided") is True:
         raise ValueError("该记录已作废")
 
@@ -327,7 +352,7 @@ def invalidate_reply_target(envelope: Dict[str, Any], excel_path: Path, backend:
     entry["voided"] = True
     entry["voided_at"] = int(time.time())
     save_message_index(index)
-    return {"row": invalidated_row, "sheet_name": sheet_name}
+    return {"row": invalidated_row, "sheet_name": sheet_name, "target_record_id": record_id, "target_message_id": entry.get("message_id")}
 
 
 def run_bridge_prompt(workdir: Path, envelope: Dict[str, Any]) -> str:
@@ -446,12 +471,8 @@ def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[st
 
     if envelope["text"] == "作废":
         try:
-            if envelope.get("reply_to_message"):
-                result = invalidate_reply_target(envelope, excel_path, backend)
-                send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废对应消息的记录：第 {result['row']} 行（{result['sheet_name']}）")
-            else:
-                row = invalidate_last_record_in_excel(excel_path, backend=backend)
-                send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {row} 行")
+            result = invalidate_target_record(envelope, excel_path, backend)
+            send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {result['row']} 行（{result['sheet_name']}）")
         except Exception as exc:
             if verbose: log_json({"stage": "invalidate_error", "message_id": envelope["message_id"], "error": str(exc)})
             try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"作废失败：{exc}")

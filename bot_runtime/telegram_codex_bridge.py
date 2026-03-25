@@ -150,20 +150,19 @@ def _is_ignored_payload(payload: Dict[str, Any]) -> bool:
 
 
 def _fill_defaults(record: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    # 核心重构逻辑
     tg_date, tg_time = _default_datetime(payload)
     merged = dict(record)
-    
-    # 1. 处理 ID
-    if not str(merged.get("ID", "")).strip():
-        chat_id, msg_id = payload.get("chat_id"), payload.get("message_id")
-        merged["ID"] = f"{chat_id}:{msg_id}" if chat_id and msg_id else f"manual_{int(datetime.now().timestamp())}"
 
-    # 2. 精细化判断日期：AI 没提供或 AI 指明没识别到，则用 Telegram 时间
+    # Telegram 消息的账本 ID 必须稳定且可回溯，不能信任模型输出的任意 ID。
+    chat_id, msg_id = payload.get("chat_id"), payload.get("message_id")
+    if chat_id is not None and msg_id is not None:
+        merged["ID"] = f"{chat_id}:{msg_id}"
+    elif not str(merged.get("ID", "")).strip():
+        merged["ID"] = f"manual_{int(datetime.now().timestamp())}"
+
     if not merged.get("DateProvided") or not str(merged.get("Date", "")).strip():
         merged["Date"] = tg_date
-    
-    # 3. 精细化判断时间：AI 没提供或 AI 指明没识别到，则用 Telegram 时间
+
     if not merged.get("TimeProvided") or not str(merged.get("Time", "")).strip():
         merged["Time"] = tg_time
 
