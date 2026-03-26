@@ -78,8 +78,9 @@ Rules:
 7. If bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
 8. Currency defaults to CNY unless specified.
 9. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records.
-10. For normal income/expense, `Category` must be one of: {categories}.
-11. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
+10. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
+11. For normal income/expense, `Category` must be one of: {categories}.
+12. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
 
 Telegram envelope:
 {envelope}
