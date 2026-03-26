@@ -437,6 +437,28 @@ def send_reply(token: str, chat_id: int, reply_to_message_id: int, text: str, pa
     return api_request(token, "sendMessage", payload)
 
 
+def safe_send_reply(
+    token: str,
+    chat_id: int,
+    reply_to_message_id: int,
+    text: str,
+    verbose: bool,
+    stage: str,
+    parse_mode: str | None = None,
+) -> Dict[str, Any] | None:
+    try:
+        return send_reply(token, chat_id, reply_to_message_id, text, parse_mode=parse_mode)
+    except Exception as exc:
+        if verbose:
+            log_json({
+                "stage": stage,
+                "chat_id": chat_id,
+                "message_id": reply_to_message_id,
+                "error": str(exc),
+            })
+        return None
+
+
 def trigger_bot_restart(verbose: bool) -> None:
     subprocess.Popen(["bash", str(RESTART_SCRIPT_PATH)], cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
     if verbose: log_json({"stage": "restart_triggered"})
@@ -465,23 +487,20 @@ def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[st
     envelope = build_envelope(message)
     if envelope["text"] == "重启":
         queue_restart_confirmation(state_path, envelope["chat_id"], envelope["message_id"])
-        try: send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人")
-        except: pass
+        safe_send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人", verbose, "restart_reply_failed")
         trigger_bot_restart(verbose)
         return
 
     if envelope["text"] == "作废":
         try:
             result = invalidate_target_record(envelope, excel_path, backend)
-            send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {result['row']} 行（{result['sheet_name']}）")
+            safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {result['row']} 行（{result['sheet_name']}）", verbose, "invalidate_reply_failed")
         except Exception as exc:
             if verbose: log_json({"stage": "invalidate_error", "message_id": envelope["message_id"], "error": str(exc)})
-            try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"作废失败：{exc}")
-            except: pass
+            safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"作废失败：{exc}", verbose, "invalidate_error_reply_failed")
         return
 
-    try: send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理...")
-    except: pass
+    safe_send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理...", verbose, "processing_reply_failed")
 
     apply_result = None
     fallback_used = False
@@ -501,8 +520,7 @@ def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[st
 
         if verbose: log_json({"stage": "applied", "message_id": envelope["message_id"], "result": apply_result})
         if apply_result.get("ignored"):
-            try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"已忽略：{apply_result.get('reason', '不是记账相关消息')}")
-            except: pass
+            safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"已忽略：{apply_result.get('reason', '不是记账相关消息')}", verbose, "ignored_reply_failed")
             return
 
         try: register_record_mapping(envelope, apply_result)
@@ -518,13 +536,10 @@ def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[st
             if r['Note']: reply += f" / {r['Note']}"
             reply += f"，第 {apply_result['row']} 行{confirm_hint}"
         
-        try: send_reply(token, envelope["chat_id"], envelope["message_id"], reply)
-        except Exception as reply_exc:
-            if verbose: log_json({"stage": "reply_network_error", "message_id": envelope["message_id"], "error": str(reply_exc)})
+        safe_send_reply(token, envelope["chat_id"], envelope["message_id"], reply, verbose, "reply_network_error")
     except Exception as exc:
         if verbose: log_json({"stage": "critical_error", "message_id": envelope.get("message_id"), "error": str(exc)})
-        try: send_reply(token, envelope["chat_id"], envelope["message_id"], f"系统故障，无法记账：{exc}")
-        except: pass
+        safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"系统故障，无法记账：{exc}", verbose, "critical_error_reply_failed")
 
 
 def poll_loop(token: str, workdir: Path, state_path: Path, allowed_username: str, backend: str, excel_path: Path, verbose: bool) -> None:
