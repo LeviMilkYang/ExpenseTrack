@@ -81,17 +81,15 @@ Rules:
 {{"ignored":true,"reason":"short reason","record":null}}
 4. Otherwise set `"ignored": false`, `"reason": ""`, and make `record` use this schema:
 {record_shape}
-5. `Timezone` must always be present. If the user explicitly provides a UTC offset, return that exact offset normalized as `UTC+HH:MM` or `UTC-HH:MM`. If the user does not provide a timezone, return `UTC+08:00`.
-6. Only treat explicit UTC/GMT offsets as provided timezones, such as `UTC+8`, `UTC+08:00`, `UTC-5`, `GMT+0`, `UTC+05:30`, `UTC+05:45`. Valid range is `UTC-12:00` to `UTC+14:00`.
-7. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号").
-8. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点").
-9. If the user provides a timezone but does not provide a numeric time, keep `TimeProvided` as false and do not invent a time in JSON.
-10. If bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
-11. Currency defaults to CNY unless specified.
-12. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records.
-13. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
-14. For normal income/expense, `Category` must be one of: {categories}.
-15. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
+5. `Timezone` must always be present. If the user explicitly provides a UTC/GMT offset, return it normalized as `UTC+HH:MM` or `UTC-HH:MM`; otherwise return `UTC+08:00`.
+6. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号").
+7. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点").
+8. If bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
+9. Currency defaults to CNY unless specified.
+10. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records.
+11. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
+12. For normal income/expense, `Category` must be one of: {categories}.
+13. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
 
 Telegram envelope:
 {envelope}
