@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from append_excel_entry import append_record_to_excel, get_allowed_categories, normalize_record
+from append_excel_entry import (
+    DEFAULT_TIMEZONE,
+    append_record_to_excel,
+    convert_telegram_timestamp,
+    get_allowed_categories,
+    normalize_record,
+    normalize_timezone,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -26,11 +32,12 @@ CODEX_RECORD_SCHEMA: Dict[str, Any] = {
         "record": {
             "type": ["object", "null"],
             "additionalProperties": False,
-            "required": ["ID", "Date", "Time", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
+            "required": ["ID", "Date", "Time", "Timezone", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
             "properties": {
                 "ID": {"type": "string"},
                 "Date": {"type": "string"},
                 "Time": {"type": "string"},
+                "Timezone": {"type": "string"},
                 "DateProvided": {"type": "boolean"},
                 "TimeProvided": {"type": "boolean"},
                 "Amount": {"type": "number"},
@@ -53,6 +60,7 @@ PROMPT_OUTPUT_SHAPE: Dict[str, Any] = {
 PROMPT_RECORD_SHAPE: Dict[str, Any] = {
     "Date": "YYYY-MM-DD",
     "Time": "HH:MM",
+    "Timezone": DEFAULT_TIMEZONE,
     "DateProvided": "boolean",
     "TimeProvided": "boolean",
     "Amount": "number",
@@ -73,14 +81,17 @@ Rules:
 {{"ignored":true,"reason":"short reason","record":null}}
 4. Otherwise set `"ignored": false`, `"reason": ""`, and make `record` use this schema:
 {record_shape}
-5. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号").
-6. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点").
-7. If bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
-8. Currency defaults to CNY unless specified.
-9. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records.
-10. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
-11. For normal income/expense, `Category` must be one of: {categories}.
-12. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
+5. `Timezone` must always be present. If the user explicitly provides a UTC offset, return that exact offset normalized as `UTC+HH:MM` or `UTC-HH:MM`. If the user does not provide a timezone, return `UTC+08:00`.
+6. Only treat explicit UTC/GMT offsets as provided timezones, such as `UTC+8`, `UTC+08:00`, `UTC-5`, `GMT+0`, `UTC+05:30`, `UTC+05:45`. Valid range is `UTC-12:00` to `UTC+14:00`.
+7. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号").
+8. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点").
+9. If the user provides a timezone but does not provide a numeric time, keep `TimeProvided` as false and do not invent a time in JSON.
+10. If bookkeeping content is ambiguous, still output valid JSON and set `Status` to `待确认`.
+11. Currency defaults to CNY unless specified.
+12. `Status` must be one of: `""`, `待确认`, `作废`. Use `""` for normal records.
+13. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
+14. For normal income/expense, `Category` must be one of: {categories}.
+15. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
 
 Telegram envelope:
 {envelope}
@@ -96,25 +107,18 @@ def _load_payload(args: argparse.Namespace) -> Dict[str, Any]:
     raise ValueError("No JSON input.")
 
 
-def _message_datetime(payload: Dict[str, Any]) -> datetime:
+def _message_datetime(payload: Dict[str, Any], timezone_text: str) -> datetime:
     for key in ("telegram_timestamp", "message_date", "timestamp"):
         raw_value = payload.get(key)
-        if raw_value in (None, ""): continue
-        if isinstance(raw_value, (int, float)):
-            return datetime.fromtimestamp(float(raw_value), tz=timezone.utc).astimezone()
-        text_value = str(raw_value).strip()
-        if not text_value: continue
-        if re.fullmatch(r"\d+(\.\d+)?", text_value):
-            return datetime.fromtimestamp(float(text_value), tz=timezone.utc).astimezone()
         try:
-            parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.astimezone()
-        except: continue
-    return datetime.now().astimezone()
+            return convert_telegram_timestamp(raw_value, timezone_text)
+        except Exception:
+            continue
+    return convert_telegram_timestamp(None, timezone_text)
 
 
-def _default_datetime(payload: Dict[str, Any]) -> tuple[str, str]:
-    message_dt = _message_datetime(payload)
+def _default_datetime(payload: Dict[str, Any], timezone_text: str) -> tuple[str, str]:
+    message_dt = _message_datetime(payload, timezone_text)
     return message_dt.strftime("%Y-%m-%d"), message_dt.strftime("%H:%M")
 
 
@@ -151,8 +155,9 @@ def _is_ignored_payload(payload: Dict[str, Any]) -> bool:
 
 
 def _fill_defaults(record: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    tg_date, tg_time = _default_datetime(payload)
     merged = dict(record)
+    merged["Timezone"] = normalize_timezone(merged.get("Timezone", DEFAULT_TIMEZONE))
+    tg_date, tg_time = _default_datetime(payload, merged["Timezone"])
 
     # Telegram 消息的账本 ID 必须稳定且可回溯，不能信任模型输出的任意 ID。
     chat_id, msg_id = payload.get("chat_id"), payload.get("message_id")

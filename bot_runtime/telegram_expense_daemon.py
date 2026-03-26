@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 from append_excel_entry import (
+    DEFAULT_TIMEZONE,
     EXPECTED_HEADERS,
     STATUS_PENDING,
     append_record_to_excel,
+    convert_telegram_timestamp,
     invalidate_record_by_id,
     normalize_record,
     read_record_by_id,
@@ -40,11 +42,12 @@ CODEX_OUTPUT_SCHEMA: Dict[str, Any] = {
         "record": {
             "type": ["object", "null"],
             "additionalProperties": False,
-            "required": ["ID", "Date", "Time", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
+            "required": ["ID", "Date", "Time", "Timezone", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
             "properties": {
                 "ID": {"type": "string"},
                 "Date": {"type": "string"},
                 "Time": {"type": "string"},
+                "Timezone": {"type": "string"},
                 "DateProvided": {"type": "boolean"},
                 "TimeProvided": {"type": "boolean"},
                 "Amount": {"type": "number"},
@@ -441,16 +444,14 @@ def trigger_bot_restart(verbose: bool) -> None:
 
 def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
     ts = envelope.get("telegram_timestamp")
-    if ts:
-        local_tm = time.localtime(float(ts))
-        date_str, time_str = time.strftime("%Y-%m-%d", local_tm), time.strftime("%H:%M", local_tm)
-    else:
-        date_str, time_str = time.strftime("%Y-%m-%d"), time.strftime("%H:%M")
+    fallback_dt = convert_telegram_timestamp(ts, DEFAULT_TIMEZONE)
+    date_str, time_str = fallback_dt.strftime("%Y-%m-%d"), fallback_dt.strftime("%H:%M")
 
     return {
         "ID": f"{envelope.get('chat_id')}:{envelope.get('message_id')}",
         "Date": date_str,
         "Time": time_str,
+        "Timezone": DEFAULT_TIMEZONE,
         "Amount": 0,
         "Currency": "CNY",
         "Type": "支出",

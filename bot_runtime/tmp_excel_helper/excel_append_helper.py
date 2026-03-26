@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from openpyxl import load_workbook
 
-EXPECTED_HEADERS = ["ID", "Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+EXPECTED_HEADERS = ["ID", "Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+LEGACY_HEADERS = ["ID", "Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
 ID_COL = EXPECTED_HEADERS.index("ID") + 1
 DATE_COL = EXPECTED_HEADERS.index("Date") + 1
 TIME_COL = EXPECTED_HEADERS.index("Time") + 1
+TIMEZONE_COL = EXPECTED_HEADERS.index("Timezone") + 1
 STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
 
 
@@ -47,6 +49,39 @@ def find_row_by_id(worksheet, record_id: str) -> int:
     raise ValueError(f"未找到 ID 为 {record_id} 的记录")
 
 
+def normalize_timezone(value) -> str:
+    if value in (None, ""):
+        return "UTC+08:00"
+    text = str(value).strip().upper().replace("GMT", "UTC")
+    if text in {"UTC", "Z"}:
+        return "UTC+00:00"
+    if not text.startswith("UTC"):
+        return "UTC+08:00"
+    text = text.replace(" ", "")
+    sign = text[3:4]
+    if sign not in {"+", "-"}:
+        return "UTC+08:00"
+    rest = text[4:]
+    if ":" in rest:
+        hours_text, minutes_text = rest.split(":", 1)
+    else:
+        hours_text, minutes_text = rest, "00"
+    try:
+        hours = int(hours_text)
+        minutes = int(minutes_text)
+    except:
+        return "UTC+08:00"
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def timezone_to_tzinfo(value) -> timezone:
+    text = normalize_timezone(value)
+    sign = 1 if text[3] == "+" else -1
+    hours = int(text[4:6])
+    minutes = int(text[7:9])
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
 def sort_worksheet(worksheet):
     # 简单的冒泡或提取重写排序。对于 Excel 脚本，提取所有数据排序后再写回最稳妥。
     rows = []
@@ -58,11 +93,10 @@ def sort_worksheet(worksheet):
         rows.append(row_values(worksheet, r))
 
     def sort_key(row):
-        # Date 可能是 datetime.date 或 str
         d = row[DATE_COL-1]
         t = row[TIME_COL-1]
-        
-        # 统一转为 datetime 进行比较
+        tz_value = row[TIMEZONE_COL-1]
+
         if isinstance(d, str):
             try:
                 d_obj = datetime.strptime(d, "%Y-%m-%d").date()
@@ -82,8 +116,9 @@ def sort_worksheet(worksheet):
             t_obj = t.time()
         else:
             t_obj = t or dt_time(0, 0)
-            
-        return datetime.combine(d_obj, t_obj)
+
+        local_dt = datetime.combine(d_obj, t_obj, tzinfo=timezone_to_tzinfo(tz_value))
+        return local_dt.astimezone(timezone.utc)
 
     rows.sort(key=sort_key)
 
@@ -110,10 +145,13 @@ def main() -> int:
 
     actual_headers = [worksheet.cell(row=1, column=i).value for i in range(1, len(EXPECTED_HEADERS) + 1)]
     if actual_headers != EXPECTED_HEADERS:
-        # 如果是旧表，尝试升级表头
-        if actual_headers[:2] == [None, None] or actual_headers[0] != "ID":
-             for col, header in enumerate(EXPECTED_HEADERS, start=1):
-                 worksheet.cell(row=1, column=col, value=header)
+        legacy_headers = [worksheet.cell(row=1, column=i).value for i in range(1, len(LEGACY_HEADERS) + 1)]
+        if legacy_headers == LEGACY_HEADERS:
+            worksheet.insert_cols(TIMEZONE_COL, amount=1)
+            worksheet.cell(row=1, column=TIMEZONE_COL, value="Timezone")
+        elif actual_headers[:2] == [None, None] or actual_headers[0] != "ID":
+            for col, header in enumerate(EXPECTED_HEADERS, start=1):
+                worksheet.cell(row=1, column=col, value=header)
         else:
             raise ValueError(f"Header mismatch: {actual_headers}")
 

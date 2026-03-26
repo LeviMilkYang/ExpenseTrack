@@ -20,7 +20,8 @@ PROJECT_DIR = BASE_DIR.parent
 DEFAULT_SOURCE_PATH = PROJECT_DIR / "expense.xlsx"
 DEFAULT_REPORT_PATH = PROJECT_DIR / "expense_report.xlsx"
 
-DATA_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+DATA_HEADERS = ["Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+LEGACY_DATA_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
 BAR_HEADERS = ["期间", "收入合计", "支出合计", "结余合计"]
 PIE_HEADERS = ["分类", "支出合计"]
 LOAN_TYPES = {"借入", "贷出", "收回", "偿还"}
@@ -120,22 +121,27 @@ def _load_records(source_path: Path) -> list[LedgerRecord]:
 
         sheet = workbook[sheet_name]
         headers = [sheet.cell(row=1, column=idx).value for idx in range(1, len(DATA_HEADERS) + 1)]
+        data_offset = 0
         if headers != DATA_HEADERS:
-            continue
+            legacy_headers = [sheet.cell(row=1, column=idx).value for idx in range(1, len(LEGACY_DATA_HEADERS) + 1)]
+            if legacy_headers != LEGACY_DATA_HEADERS:
+                continue
+            data_offset = -1
 
-        for row in sheet.iter_rows(min_row=2, max_col=len(DATA_HEADERS), values_only=True):
+        max_col = len(DATA_HEADERS) if data_offset == 0 else len(LEGACY_DATA_HEADERS)
+        for row in sheet.iter_rows(min_row=2, max_col=max_col, values_only=True):
             if not any(value not in (None, "") for value in row):
                 continue
 
-            record_type = str(row[4]).strip()
+            record_type = str(row[5 + data_offset]).strip()
             if record_type not in {"收入", "支出"}:
                 continue
 
-            status = "" if row[7] is None else str(row[7]).strip()
+            status = "" if row[8 + data_offset] is None else str(row[8 + data_offset]).strip()
             if status == VOID_MARK:
                 continue
 
-            amount = _to_decimal(row[2])
+            amount = _to_decimal(row[3 + data_offset])
             if amount is None:
                 continue
 
@@ -144,9 +150,9 @@ def _load_records(source_path: Path) -> list[LedgerRecord]:
                     sheet_name=sheet_name,
                     record_date=_parse_excel_date(row[0]),
                     amount=amount,
-                    currency=str(row[3]).strip() or "CNY",
+                    currency=str(row[4 + data_offset]).strip() or "CNY",
                     record_type=record_type,
-                    category=str(row[5]).strip(),
+                    category=str(row[6 + data_offset]).strip(),
                     need_confirm=status,
                 )
             )
