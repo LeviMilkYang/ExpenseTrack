@@ -19,7 +19,9 @@ resolve_project_dir() {
 }
 
 PROJECT_DIR="$(resolve_project_dir)"
+CUTOFF_DATE="$(date -d "$(date +%Y-%m-01) -1 day" +%F)"
 
 python3 "$BASE_DIR/generate_expense_report.py" \
   --source "$PROJECT_DIR/expense.xlsx" \
-  --report "$PROJECT_DIR/expense_report.xlsx"
+  --report "$PROJECT_DIR/expense_report.xlsx" \
+  --cutoff-date "$CUTOFF_DATE"

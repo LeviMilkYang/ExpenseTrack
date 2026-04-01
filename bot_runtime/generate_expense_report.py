@@ -21,6 +21,7 @@ DEFAULT_SOURCE_PATH = PROJECT_DIR / "expense.xlsx"
 DEFAULT_REPORT_PATH = PROJECT_DIR / "expense_report.xlsx"
 
 DATA_HEADERS = ["Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+DATA_HEADERS_WITH_ID = ["ID", "Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "Status"]
 LEGACY_DATA_HEADERS = ["Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
 BAR_HEADERS = ["期间", "收入合计", "支出合计", "结余合计"]
 PIE_HEADERS = ["分类", "支出合计"]
@@ -37,6 +38,16 @@ class LedgerRecord:
     record_type: str
     category: str
     need_confirm: str
+
+
+@dataclass(frozen=True)
+class HeaderLayout:
+    date_idx: int
+    amount_idx: int
+    currency_idx: int
+    type_idx: int
+    category_idx: int
+    status_idx: int
 
 
 class _FormulaEvaluator(ast.NodeVisitor):
@@ -111,6 +122,22 @@ def _parse_excel_date(value) -> date:
     return datetime.strptime(text, "%Y-%m-%d").date()
 
 
+def _detect_layout(sheet) -> HeaderLayout | None:
+    headers_with_id = [sheet.cell(row=1, column=idx).value for idx in range(1, len(DATA_HEADERS_WITH_ID) + 1)]
+    if headers_with_id == DATA_HEADERS_WITH_ID:
+        return HeaderLayout(date_idx=1, amount_idx=4, currency_idx=5, type_idx=6, category_idx=7, status_idx=9)
+
+    headers = [sheet.cell(row=1, column=idx).value for idx in range(1, len(DATA_HEADERS) + 1)]
+    if headers == DATA_HEADERS:
+        return HeaderLayout(date_idx=0, amount_idx=3, currency_idx=4, type_idx=5, category_idx=6, status_idx=8)
+
+    legacy_headers = [sheet.cell(row=1, column=idx).value for idx in range(1, len(LEGACY_DATA_HEADERS) + 1)]
+    if legacy_headers == LEGACY_DATA_HEADERS:
+        return HeaderLayout(date_idx=0, amount_idx=2, currency_idx=3, type_idx=4, category_idx=5, status_idx=7)
+
+    return None
+
+
 def _load_records(source_path: Path) -> list[LedgerRecord]:
     workbook = load_workbook(source_path, data_only=False)
     records: list[LedgerRecord] = []
@@ -120,39 +147,42 @@ def _load_records(source_path: Path) -> list[LedgerRecord]:
             continue
 
         sheet = workbook[sheet_name]
-        headers = [sheet.cell(row=1, column=idx).value for idx in range(1, len(DATA_HEADERS) + 1)]
-        data_offset = 0
-        if headers != DATA_HEADERS:
-            legacy_headers = [sheet.cell(row=1, column=idx).value for idx in range(1, len(LEGACY_DATA_HEADERS) + 1)]
-            if legacy_headers != LEGACY_DATA_HEADERS:
-                continue
-            data_offset = -1
+        layout = _detect_layout(sheet)
+        if layout is None:
+            continue
 
-        max_col = len(DATA_HEADERS) if data_offset == 0 else len(LEGACY_DATA_HEADERS)
+        max_col = max(
+            layout.date_idx,
+            layout.amount_idx,
+            layout.currency_idx,
+            layout.type_idx,
+            layout.category_idx,
+            layout.status_idx,
+        ) + 1
         for row in sheet.iter_rows(min_row=2, max_col=max_col, values_only=True):
             if not any(value not in (None, "") for value in row):
                 continue
 
-            record_type = str(row[5 + data_offset]).strip()
+            record_type = str(row[layout.type_idx]).strip()
             if record_type not in {"收入", "支出"}:
                 continue
 
-            status = "" if row[8 + data_offset] is None else str(row[8 + data_offset]).strip()
+            status = "" if row[layout.status_idx] is None else str(row[layout.status_idx]).strip()
             if status == VOID_MARK:
                 continue
 
-            amount = _to_decimal(row[3 + data_offset])
+            amount = _to_decimal(row[layout.amount_idx])
             if amount is None:
                 continue
 
             records.append(
                 LedgerRecord(
                     sheet_name=sheet_name,
-                    record_date=_parse_excel_date(row[0]),
+                    record_date=_parse_excel_date(row[layout.date_idx]),
                     amount=amount,
-                    currency=str(row[4 + data_offset]).strip() or "CNY",
+                    currency=str(row[layout.currency_idx]).strip() or "CNY",
                     record_type=record_type,
-                    category=str(row[6 + data_offset]).strip(),
+                    category=str(row[layout.category_idx]).strip(),
                     need_confirm=status,
                 )
             )
@@ -161,6 +191,12 @@ def _load_records(source_path: Path) -> list[LedgerRecord]:
 
 def _filter_currency(records: Iterable[LedgerRecord], currency: str) -> list[LedgerRecord]:
     return [record for record in records if record.currency == currency and record.record_type not in LOAN_TYPES]
+
+
+def _apply_cutoff(records: Iterable[LedgerRecord], cutoff_date: date | None) -> list[LedgerRecord]:
+    if cutoff_date is None:
+        return list(records)
+    return [record for record in records if record.record_date <= cutoff_date]
 
 
 def _build_monthly_rows(records: Iterable[LedgerRecord]) -> list[list[object]]:
@@ -235,18 +271,51 @@ def _style_table(sheet, headers: list[str], start_row: int) -> None:
         for cell in row:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = '#,##0.00;-#,##0.00'
-    if sheet.freeze_panes is None:
-        sheet.freeze_panes = f"A{start_row + 1}"
     _autosize(sheet)
 
 
-def _build_summary_sheet(workbook: Workbook, currency: str, monthly_rows: list[list[object]], yearly_rows: list[list[object]]) -> None:
+def _summary_totals(rows: list[list[object]]) -> tuple[float, float, float]:
+    income = sum(float(row[1]) for row in rows)
+    expense = sum(float(row[2]) for row in rows)
+    return income, expense, income - expense
+
+
+def _write_kpi_card(sheet, label_cell: str, value_cell: str, label: str, value: float | str) -> None:
+    sheet[label_cell] = label
+    sheet[label_cell].font = Font(bold=True, color="FFFFFF")
+    sheet[label_cell].fill = PatternFill("solid", fgColor="1F4E78")
+    sheet[label_cell].alignment = Alignment(horizontal="center")
+
+    sheet[value_cell] = value
+    sheet[value_cell].font = Font(size=13, bold=True)
+    sheet[value_cell].fill = PatternFill("solid", fgColor="DCE6F1")
+    sheet[value_cell].alignment = Alignment(horizontal="center")
+    if isinstance(value, (int, float)):
+        sheet[value_cell].number_format = '#,##0.00;-#,##0.00'
+
+
+def _build_summary_sheet(
+    workbook: Workbook,
+    currency: str,
+    monthly_rows: list[list[object]],
+    yearly_rows: list[list[object]],
+    as_of_date: date | None,
+) -> None:
     sheet = workbook.create_sheet(title=f"总览_{currency}")
+    sheet.freeze_panes = None
     sheet["A1"] = f"{currency} 收支统计"
     sheet["A1"].font = Font(size=16, bold=True)
-    sheet["A3"] = "统计口径：仅统计收入/支出，排除借贷操作与已作废记录。"
+    cutoff_month = as_of_date.strftime("%Y-%m") if as_of_date else "无数据"
+    cutoff_date_text = as_of_date.strftime("%Y-%m-%d") if as_of_date else "无数据"
+    sheet["A2"] = f"统计截止月份：{cutoff_month}（截至 {cutoff_date_text}）"
+    sheet["A4"] = "统计口径：仅统计收入/支出，排除借贷操作与已作废记录。"
 
-    start_month_row = 6
+    total_income, total_expense, total_balance = _summary_totals(monthly_rows)
+    _write_kpi_card(sheet, "A6", "B6", "累计收入", total_income)
+    _write_kpi_card(sheet, "C6", "D6", "累计支出", total_expense)
+    _write_kpi_card(sheet, "E6", "F6", "累计结余", total_balance)
+
+    start_month_row = 9
     for offset, header in enumerate(BAR_HEADERS, start=1):
         sheet.cell(row=start_month_row, column=offset, value=header)
     for row_offset, values in enumerate(monthly_rows, start=1):
@@ -254,7 +323,7 @@ def _build_summary_sheet(workbook: Workbook, currency: str, monthly_rows: list[l
             sheet.cell(row=start_month_row + row_offset, column=column_idx, value=value)
     _style_table(sheet, BAR_HEADERS, start_month_row)
 
-    start_year_row = max(start_month_row + len(monthly_rows) + 4, 24)
+    start_year_row = start_month_row + len(monthly_rows) + 4
     for offset, header in enumerate(BAR_HEADERS, start=1):
         sheet.cell(row=start_year_row, column=offset, value=header)
     for row_offset, values in enumerate(yearly_rows, start=1):
@@ -275,7 +344,7 @@ def _build_summary_sheet(workbook: Workbook, currency: str, monthly_rows: list[l
         monthly_chart.add_data(data, titles_from_data=True)
         monthly_chart.set_categories(categories)
         monthly_chart.legend.position = "r"
-    sheet.add_chart(monthly_chart, "F3")
+    sheet.add_chart(monthly_chart, "H3")
 
     yearly_chart = BarChart()
     yearly_chart.type = "col"
@@ -291,7 +360,8 @@ def _build_summary_sheet(workbook: Workbook, currency: str, monthly_rows: list[l
         yearly_chart.add_data(data, titles_from_data=True)
         yearly_chart.set_categories(categories)
         yearly_chart.legend.position = "r"
-    sheet.add_chart(yearly_chart, "F22")
+    chart_row = max(start_year_row + len(yearly_rows) + 3, 22)
+    sheet.add_chart(yearly_chart, f"H{chart_row}")
 
     _style_table(sheet, BAR_HEADERS, start_year_row)
     _autosize(sheet)
@@ -331,6 +401,7 @@ def _add_pie_chart(sheet, title: str, start_row: int, chart_cell: str, rows: lis
 
 def _build_category_sheet(workbook: Workbook, currency: str, total_rows: list[list[object]], yearly_rows: dict[str, list[list[object]]]) -> None:
     sheet = workbook.create_sheet(title=f"分类占比_{currency}")
+    sheet.freeze_panes = None
     sheet["A1"] = f"{currency} 各分类支出占比"
     sheet["A1"].font = Font(size=16, bold=True)
     sheet["A3"] = "统计口径：仅统计支出，排除借贷操作与已作废记录。"
@@ -349,11 +420,12 @@ def _build_category_sheet(workbook: Workbook, currency: str, total_rows: list[li
     _autosize(sheet)
 
 
-def refresh_report_workbook(source_path: str | Path, report_path: str | Path | None = None) -> Path:
+def refresh_report_workbook(source_path: str | Path, report_path: str | Path | None = None, cutoff_date: date | None = None) -> Path:
     source = Path(source_path).resolve()
     target = Path(report_path).resolve() if report_path else source.with_name("expense_report.xlsx")
-    records = _load_records(source)
+    records = _apply_cutoff(_load_records(source), cutoff_date)
     currencies = sorted({record.currency for record in records}) or ["CNY"]
+    as_of_date = max((record.record_date for record in records), default=None)
 
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -375,7 +447,7 @@ def refresh_report_workbook(source_path: str | Path, report_path: str | Path | N
         monthly_rows = _build_monthly_rows(currency_records)
         yearly_rows = _build_yearly_rows(currency_records)
         total_rows, yearly_category_rows = _build_category_rows(currency_records)
-        _build_summary_sheet(workbook, currency, monthly_rows, yearly_rows)
+        _build_summary_sheet(workbook, currency, monthly_rows, yearly_rows, as_of_date)
         _build_category_sheet(workbook, currency, total_rows, yearly_category_rows)
 
     workbook.save(target)
@@ -386,12 +458,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate chart-based report workbook from expense.xlsx.")
     parser.add_argument("--source", default=str(DEFAULT_SOURCE_PATH))
     parser.add_argument("--report", default=str(DEFAULT_REPORT_PATH))
+    parser.add_argument("--cutoff-date", default="", help="Only include records on or before YYYY-MM-DD.")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    report_path = refresh_report_workbook(args.source, args.report)
+    cutoff_date = datetime.strptime(args.cutoff_date, "%Y-%m-%d").date() if str(args.cutoff_date).strip() else None
+    report_path = refresh_report_workbook(args.source, args.report, cutoff_date=cutoff_date)
     print(report_path)
     return 0
 

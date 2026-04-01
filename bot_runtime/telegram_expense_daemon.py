@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
 
@@ -150,6 +151,11 @@ def current_report_period() -> str:
     return time.strftime("%Y-%m", time.localtime())
 
 
+def report_cutoff_date(current_period: str) -> datetime.date:
+    current_month_start = datetime.strptime(f"{current_period}-01", "%Y-%m-%d").date()
+    return current_month_start - timedelta(days=1)
+
+
 def refresh_report_if_period_changed(state_path: Path, excel_path: Path, verbose: bool) -> None:
     state = load_state(state_path)
     current_period = current_report_period()
@@ -159,11 +165,12 @@ def refresh_report_if_period_changed(state_path: Path, excel_path: Path, verbose
     if last_period == current_period and report_path.exists():
         return
 
-    refresh_report_workbook(excel_path, report_path)
+    cutoff_date = report_cutoff_date(current_period)
+    refresh_report_workbook(excel_path, report_path, cutoff_date=cutoff_date)
     state["report_period"] = current_period
     save_state(state_path, state)
     if verbose:
-        log_json({"stage": "report_refreshed", "period": current_period, "report_path": str(report_path)})
+        log_json({"stage": "report_refreshed", "period": current_period, "cutoff_date": cutoff_date.isoformat(), "report_path": str(report_path)})
 
 
 def load_token(state_path: Path, legacy_token_path: Path | None = None) -> str:
