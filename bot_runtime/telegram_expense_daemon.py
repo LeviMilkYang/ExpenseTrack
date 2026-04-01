@@ -27,6 +27,8 @@ from append_excel_entry import (
 from generate_expense_report import refresh_report_workbook
 
 API_TIMEOUT_SECONDS = 60
+RETRY_SLEEP_SECONDS = 5
+NETWORK_LOG_INTERVAL_SECONDS = 600
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 RESTART_SCRIPT_PATH = BASE_DIR / "restart_bot.sh"
@@ -91,6 +93,48 @@ def log_json(payload: Dict[str, Any]) -> None:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except:
         pass
+
+
+def maybe_log_network_outage(
+    verbose: bool,
+    outage_started_at: float | None,
+    last_logged_at: float | None,
+    stage: str,
+    exc: Exception,
+) -> tuple[float, float]:
+    now = time.time()
+    if outage_started_at is None:
+        outage_started_at = now
+
+    should_log = last_logged_at is None or (now - last_logged_at) >= NETWORK_LOG_INTERVAL_SECONDS
+    if should_log and verbose:
+        log_json(
+            {
+                "stage": stage,
+                "error_type": classify_network_error(exc),
+                "error": str(exc),
+                "outage_started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outage_started_at)),
+                "retry_interval_seconds": RETRY_SLEEP_SECONDS,
+                "log_interval_seconds": NETWORK_LOG_INTERVAL_SECONDS,
+            }
+        )
+        last_logged_at = now
+
+    return outage_started_at, last_logged_at
+
+
+def log_network_recovered(verbose: bool, outage_started_at: float | None) -> None:
+    if not verbose or outage_started_at is None:
+        return
+
+    recovered_at = time.time()
+    log_json(
+        {
+            "stage": "network_recovered",
+            "outage_started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outage_started_at)),
+            "outage_duration_seconds": int(recovered_at - outage_started_at),
+        }
+    )
 
 
 def api_request(token: str, method: str, payload: Dict[str, Any] | None = None, timeout: int = 30) -> Dict[str, Any]:
@@ -171,6 +215,26 @@ def refresh_report_if_period_changed(state_path: Path, excel_path: Path, verbose
     save_state(state_path, state)
     if verbose:
         log_json({"stage": "report_refreshed", "period": current_period, "cutoff_date": cutoff_date.isoformat(), "report_path": str(report_path)})
+
+
+def wait_until_telegram_ready(token: str, verbose: bool) -> Dict[str, Any]:
+    outage_started_at: float | None = None
+    last_logged_at: float | None = None
+
+    while True:
+        try:
+            result = api_request(token, "getMe")
+            log_network_recovered(verbose, outage_started_at)
+            return result
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise RuntimeError("Unauthorized bot token") from exc
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+        except urllib.error.URLError as exc:
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+        except Exception as exc:
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+        time.sleep(RETRY_SLEEP_SECONDS)
 
 
 def load_token(state_path: Path, legacy_token_path: Path | None = None) -> str:
@@ -552,12 +616,17 @@ def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[st
 def poll_loop(token: str, workdir: Path, state_path: Path, allowed_username: str, backend: str, excel_path: Path, verbose: bool) -> None:
     state = load_state(state_path)
     offset = int(state.get("offset", 0))
+    outage_started_at: float | None = None
+    last_logged_at: float | None = None
     while True:
         try:
             refresh_report_if_period_changed(state_path, excel_path, verbose)
             state = load_state(state_path)
             state["offset"] = offset
             result = api_request(token, "getUpdates", {"offset": offset, "timeout": API_TIMEOUT_SECONDS, "allowed_updates": ["message"]}, timeout=API_TIMEOUT_SECONDS + 10)
+            log_network_recovered(verbose, outage_started_at)
+            outage_started_at = None
+            last_logged_at = None
             for update in result.get("result", []):
                 update_id = int(update["update_id"])
                 offset = update_id + 1
@@ -573,14 +642,14 @@ def poll_loop(token: str, workdir: Path, state_path: Path, allowed_username: str
                 except Exception as exc: log_json({"stage": "handle_message_crash", "error": str(exc)})
         except urllib.error.HTTPError as exc:
             if exc.code == 401: raise RuntimeError("Unauthorized bot token") from exc
-            if verbose: log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
-            time.sleep(5)
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_error", exc)
+            time.sleep(RETRY_SLEEP_SECONDS)
         except urllib.error.URLError as exc:
-            if verbose: log_json({"stage": "network_error", "error_type": classify_network_error(exc), "error": str(exc)})
-            time.sleep(5)
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_error", exc)
+            time.sleep(RETRY_SLEEP_SECONDS)
         except Exception as exc:
-            if verbose: log_json({"stage": "loop_error", "error_type": classify_network_error(exc), "error": str(exc)})
-            time.sleep(5)
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "loop_error", exc)
+            time.sleep(RETRY_SLEEP_SECONDS)
 
 
 def main() -> int:
@@ -597,7 +666,7 @@ def main() -> int:
     state = load_state(state_path)
     excel_path = Path(args.excel_path) if str(args.excel_path).strip() else configured_excel_path(state)
     token = load_token(state_path, Path(args.legacy_token_file))
-    me = api_request(token, "getMe")
+    me = wait_until_telegram_ready(token, args.verbose)
     if args.verbose: log_json({"stage": "getMe", "result": me["result"]})
     send_pending_restart_confirmation(token, state_path, args.verbose)
     if args.once: return 0
