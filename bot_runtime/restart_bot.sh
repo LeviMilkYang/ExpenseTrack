@@ -5,6 +5,9 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$BASE_DIR/.." && pwd)"
 STATE_FILE="$BASE_DIR/telegram_bot_config.json"
+STATUS_SCRIPT="$BASE_DIR/status_bot.sh"
+STOP_SCRIPT="$BASE_DIR/stop_bot.sh"
+START_SCRIPT="$BASE_DIR/start_bot.sh"
 
 resolve_project_dir() {
   if [[ -f "$STATE_FILE" ]]; then
@@ -24,10 +27,10 @@ echo "validating new daemon startup..."
 python3 "$BASE_DIR/telegram_expense_daemon.py" --once --verbose --state-file "$STATE_FILE" --excel-path "$PROJECT_DIR/expense.xlsx"
 echo "validation passed"
 
-if "$BASE_DIR/status_bot.sh" >/dev/null 2>&1; then
+if "$STATUS_SCRIPT" >/dev/null 2>&1; then
   echo "stopping current daemon..."
-  "$BASE_DIR/stop_bot.sh"
+  "$STOP_SCRIPT"
 fi
 
 echo "starting new daemon..."
-"$BASE_DIR/start_bot.sh"
+"$START_SCRIPT"

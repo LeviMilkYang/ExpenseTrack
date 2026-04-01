@@ -6,6 +6,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$BASE_DIR/.." && pwd)"
 STATE_FILE="$BASE_DIR/telegram_bot_config.json"
 PID_FILE="$BASE_DIR/telegram_expense_daemon.pid"
+STATUS_SCRIPT="$BASE_DIR/status_bot.sh"
 
 # 日志目录
 LOG_DIR="$BASE_DIR/logs"
@@ -33,27 +34,28 @@ is_running() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
-if [[ -f "$PID_FILE" ]]; then
-  existing_pid="$(tr -d '[:space:]' < "$PID_FILE")"
-  if is_running "$existing_pid"; then
-    echo "telegram_expense_daemon.py is already running with PID $existing_pid"
-    exit 0
-  fi
-  rm -f "$PID_FILE"
+if "$STATUS_SCRIPT" >/tmp/telegram_expense_status.out 2>/tmp/telegram_expense_status.err; then
+  cat /tmp/telegram_expense_status.out
+  rm -f /tmp/telegram_expense_status.out /tmp/telegram_expense_status.err
+  exit 0
 fi
+rm -f /tmp/telegram_expense_status.out /tmp/telegram_expense_status.err
+rm -f "$PID_FILE"
 
 # 启动机器人，机器人内部也会写入该日志文件
 nohup python3 -u "$BASE_DIR/telegram_expense_daemon.py" --verbose --state-file "$STATE_FILE" --excel-path "$PROJECT_DIR/expense.xlsx" >>"$CURRENT_LOG" 2>&1 </dev/null &
 daemon_pid=$!
 echo "$daemon_pid" > "$PID_FILE"
 
-sleep 1
-if is_running "$daemon_pid"; then
+sleep 2
+if "$STATUS_SCRIPT" >/tmp/telegram_expense_status.out 2>/tmp/telegram_expense_status.err; then
   echo "started telegram_expense_daemon.py with PID $daemon_pid"
   echo "log: $CURRENT_LOG"
+  rm -f /tmp/telegram_expense_status.out /tmp/telegram_expense_status.err
   exit 0
 fi
 
+rm -f /tmp/telegram_expense_status.out /tmp/telegram_expense_status.err
 rm -f "$PID_FILE"
 echo "failed to start telegram_expense_daemon.py"
 exit 1
