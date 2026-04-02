@@ -15,41 +15,11 @@ from append_excel_entry import (
     normalize_record,
     normalize_timezone,
 )
+from telegram_record_schema import CODEX_OUTPUT_SCHEMA
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 DEFAULT_EXCEL_PATH = PROJECT_DIR / "expense.xlsx"
-
-# 更新 Schema：增加显式的日期/时间提供标志
-CODEX_RECORD_SCHEMA: Dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["ignored", "reason", "record"],
-    "properties": {
-        "ignored": {"type": "boolean"},
-        "reason": {"type": "string"},
-        "record": {
-            "type": ["object", "null"],
-            "additionalProperties": False,
-            "required": ["ID", "Date", "Time", "Timezone", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
-            "properties": {
-                "ID": {"type": "string"},
-                "Date": {"type": "string"},
-                "Time": {"type": "string"},
-                "Timezone": {"type": "string"},
-                "DateProvided": {"type": "boolean"},
-                "TimeProvided": {"type": "boolean"},
-                "Amount": {"type": "number"},
-                "Currency": {"type": "string"},
-                "Type": {"type": "string", "enum": ["收入", "支出", "借入", "贷出", "收回", "偿还"]},
-                "Category": {"type": "string"},
-                "Note": {"type": "string"},
-                "Status": {"type": "string"},
-            },
-        },
-    },
-}
 
 PROMPT_OUTPUT_SHAPE: Dict[str, Any] = {
     "ignored": "boolean",

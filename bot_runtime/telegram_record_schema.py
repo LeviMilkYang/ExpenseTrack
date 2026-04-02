@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+RECORD_REQUIRED_FIELDS = [
+    "ID",
+    "Date",
+    "Time",
+    "Timezone",
+    "DateProvided",
+    "TimeProvided",
+    "Amount",
+    "Currency",
+    "Type",
+    "Category",
+    "Note",
+    "Status",
+]
+
+RECORD_PROPERTIES: Dict[str, Any] = {
+    "ID": {"type": "string"},
+    "Date": {"type": "string"},
+    "Time": {"type": "string"},
+    "Timezone": {"type": "string"},
+    "DateProvided": {"type": "boolean"},
+    "TimeProvided": {"type": "boolean"},
+    "Amount": {"type": "number"},
+    "Currency": {"type": "string"},
+    "Type": {"type": "string", "enum": ["收入", "支出", "借入", "贷出", "收回", "偿还"]},
+    "Category": {"type": "string"},
+    "Note": {"type": "string"},
+    "Status": {"type": "string"},
+}
+
+CODEX_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["ignored", "reason", "record"],
+    "properties": {
+        "ignored": {"type": "boolean"},
+        "reason": {"type": "string"},
+        "record": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": RECORD_REQUIRED_FIELDS,
+            "properties": RECORD_PROPERTIES,
+        },
+    },
+}

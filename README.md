@@ -18,12 +18,14 @@
 
 ## 本地私有配置
 
-所有本地私密配置都保存在 `bot_runtime/telegram_bot_config.json`，不要提交到 Git。
+所有本地私密配置和 bot 运行态都保存在 `bot_runtime/telegram_bot_config.json`，不要提交到 Git。
 
 当前这个文件里至少会用到这些字段：
 
 - `token`：Telegram bot token
 - `offset`：Telegram `getUpdates` 的消费游标
+- `report_period`：当前报表月份缓存
+- `pending_restart_notice`：重启确认消息的待发送状态
 - `allowed_username`：白名单 Telegram 用户名
 - `project_dir`：项目根目录绝对路径，用来推导 `expense.xlsx` 和 `expense_report.xlsx`
 - `allowed_categories`：合法收支分类集合
@@ -47,6 +49,8 @@
 - **认证失败快速退出**：若 Telegram API 返回 `401 Unauthorized`，守护进程会记录致命认证错误并直接退出，避免持续刷日志。
 
 ## 运行与维护
+
+以下脚本必须在 WSL/Linux 环境里执行；Windows 侧不能可靠判断 WSL 里的 daemon 进程状态。
 
 启动/停止/状态/重启：
 ```bash

@@ -2,29 +2,18 @@
 
 set -euo pipefail
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$BASE_DIR/.." && pwd)"
-STATE_FILE="$BASE_DIR/telegram_bot_config.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/bot_common.sh"
 STATUS_SCRIPT="$BASE_DIR/status_bot.sh"
 STOP_SCRIPT="$BASE_DIR/stop_bot.sh"
 START_SCRIPT="$BASE_DIR/start_bot.sh"
-
-resolve_project_dir() {
-  if [[ -f "$STATE_FILE" ]]; then
-    local configured
-    configured="$(python3 -c 'import json, sys; from pathlib import Path; data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")); print(str(data.get("project_dir", "")).strip())' "$STATE_FILE" 2>/dev/null || true)"
-    if [[ -n "$configured" ]]; then
-      echo "$configured"
-      return
-    fi
-  fi
-  echo "$PROJECT_DIR"
-}
-
 PROJECT_DIR="$(resolve_project_dir)"
 
 echo "validating new daemon startup..."
-python3 "$BASE_DIR/telegram_expense_daemon.py" --once --verbose --state-file "$STATE_FILE" --excel-path "$PROJECT_DIR/expense.xlsx"
+if ! timeout 40s python3 "$BASE_DIR/telegram_expense_daemon.py" --once --verbose --startup-timeout-seconds 30 --state-file "$STATE_FILE" --excel-path "$PROJECT_DIR/expense.xlsx"; then
+  echo "validation failed or timed out"
+  exit 1
+fi
 echo "validation passed"
 
 if "$STATUS_SCRIPT" >/dev/null 2>&1; then

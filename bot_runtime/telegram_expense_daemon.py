@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import subprocess
@@ -8,7 +9,6 @@ import sys
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,44 +25,31 @@ from append_excel_entry import (
     read_record_by_id,
 )
 from generate_expense_report import refresh_report_workbook
+from telegram_record_schema import CODEX_OUTPUT_SCHEMA
 
 API_TIMEOUT_SECONDS = 60
 RETRY_SLEEP_SECONDS = 5
 NETWORK_LOG_INTERVAL_SECONDS = 600
+SEND_REPLY_TIMEOUT_SECONDS = 15
+SEND_RETRY_ATTEMPTS = 3
+SEND_RETRY_BASE_SLEEP_SECONDS = 2
+PENDING_REPLY_BATCH_SIZE = 10
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 RESTART_SCRIPT_PATH = BASE_DIR / "restart_bot.sh"
 VOID_MARK = "作废"
-CONFIG_FILE_NAME = "telegram_bot_state.json"
-CODEX_OUTPUT_SCHEMA: Dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["ignored", "reason", "record"],
-    "properties": {
-        "ignored": {"type": "boolean"},
-        "reason": {"type": "string"},
-        "record": {
-            "type": ["object", "null"],
-            "additionalProperties": False,
-            "required": ["ID", "Date", "Time", "Timezone", "DateProvided", "TimeProvided", "Amount", "Currency", "Type", "Category", "Note", "Status"],
-            "properties": {
-                "ID": {"type": "string"},
-                "Date": {"type": "string"},
-                "Time": {"type": "string"},
-                "Timezone": {"type": "string"},
-                "DateProvided": {"type": "boolean"},
-                "TimeProvided": {"type": "boolean"},
-                "Amount": {"type": "number"},
-                "Currency": {"type": "string"},
-                "Type": {"type": "string", "enum": ["收入", "支出", "借入", "贷出", "收回", "偿还"]},
-                "Category": {"type": "string"},
-                "Note": {"type": "string"},
-                "Status": {"type": "string"},
-            },
-        },
-    },
-}
+CONFIG_FILE_NAME = "telegram_bot_config.json"
+
+
+@dataclass(frozen=True)
+class RuntimeContext:
+    token: str
+    workdir: Path
+    state_path: Path
+    allowed_username: str
+    backend: str
+    excel_path: Path
+    verbose: bool
 
 
 def classify_network_error(exc: Exception) -> str:
@@ -86,11 +73,20 @@ def get_monthly_file_path(base_name: str, ext: str) -> Path:
 
 
 def log_json(payload: Dict[str, Any]) -> None:
-    payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    ordered_payload: Dict[str, Any] = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+    if "stage" in payload:
+        ordered_payload["stage"] = payload["stage"]
+    for key, value in payload.items():
+        if key in {"timestamp", "stage"}:
+            continue
+        ordered_payload[key] = value
+
     log_file = get_monthly_file_path("logs", "log")
     try:
         with log_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            f.write(json.dumps(ordered_payload, ensure_ascii=False) + "\n")
     except:
         pass
 
@@ -164,6 +160,96 @@ def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def update_state(state_path: Path, **changes: Any) -> Dict[str, Any]:
+    state = load_state(state_path)
+    state.update(changes)
+    save_state(state_path, state)
+    return state
+
+
+def _state_reply_queue(state: Dict[str, Any]) -> list[Dict[str, Any]]:
+    queue = state.get("pending_replies")
+    if not isinstance(queue, list):
+        return []
+    return [item for item in queue if isinstance(item, dict)]
+
+
+def _reply_queue_identity(entry: Dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+    return (
+        entry.get("chat_id"),
+        entry.get("reply_to_message_id"),
+        entry.get("text"),
+        entry.get("parse_mode"),
+    )
+
+
+def queue_pending_reply(
+    state_path: Path,
+    chat_id: int,
+    reply_to_message_id: int,
+    text: str,
+    stage: str,
+    parse_mode: str | None = None,
+    error: str = "",
+) -> None:
+    state = load_state(state_path)
+    queue = _state_reply_queue(state)
+    queued_at = int(time.time())
+    new_entry = {
+        "chat_id": chat_id,
+        "reply_to_message_id": reply_to_message_id,
+        "text": text,
+        "parse_mode": parse_mode or "",
+        "stage": stage,
+        "queued_at": queued_at,
+        "last_error": error,
+        "attempts": 0,
+    }
+
+    new_identity = _reply_queue_identity(new_entry)
+    updated_queue: list[Dict[str, Any]] = []
+    replaced = False
+    for entry in queue:
+        if _reply_queue_identity(entry) == new_identity:
+            updated = dict(entry)
+            updated["stage"] = stage
+            updated["last_error"] = error
+            updated["queued_at"] = entry.get("queued_at", queued_at)
+            updated_queue.append(updated)
+            replaced = True
+            continue
+        updated_queue.append(entry)
+
+    if not replaced:
+        updated_queue.append(new_entry)
+
+    state["pending_replies"] = updated_queue
+    state.pop("pending_restart_notice", None)
+    save_state(state_path, state)
+
+
+def migrate_legacy_pending_restart_notice(state_path: Path) -> None:
+    state = load_state(state_path)
+    notice = state.get("pending_restart_notice")
+    if not isinstance(notice, dict):
+        return
+
+    chat_id = notice.get("chat_id")
+    reply_to_message_id = notice.get("reply_to_message_id")
+    if isinstance(chat_id, int) and isinstance(reply_to_message_id, int):
+        queue_pending_reply(
+            state_path,
+            chat_id,
+            reply_to_message_id,
+            "机器人已重启完成",
+            stage="restart_reply_failed",
+        )
+        state = load_state(state_path)
+
+    state.pop("pending_restart_notice", None)
+    save_state(state_path, state)
+
+
 def load_message_index() -> Dict[str, Any]:
     index_path = get_monthly_file_path("indexes", "json")
     if not index_path.exists():
@@ -217,9 +303,11 @@ def refresh_report_if_period_changed(state_path: Path, excel_path: Path, verbose
         log_json({"stage": "report_refreshed", "period": current_period, "cutoff_date": cutoff_date.isoformat(), "report_path": str(report_path)})
 
 
-def wait_until_telegram_ready(token: str, verbose: bool) -> Dict[str, Any]:
+def wait_until_telegram_ready(token: str, verbose: bool, startup_timeout_seconds: int = 0) -> Dict[str, Any]:
     outage_started_at: float | None = None
     last_logged_at: float | None = None
+    started_at = time.time()
+    last_exception: Exception | None = None
 
     while True:
         try:
@@ -227,13 +315,24 @@ def wait_until_telegram_ready(token: str, verbose: bool) -> Dict[str, Any]:
             log_network_recovered(verbose, outage_started_at)
             return result
         except urllib.error.HTTPError as exc:
+            last_exception = exc
             if exc.code == 401:
                 raise RuntimeError("Unauthorized bot token") from exc
             outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
         except urllib.error.URLError as exc:
+            last_exception = exc
             outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
         except Exception as exc:
+            last_exception = exc
             outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+
+        if startup_timeout_seconds > 0 and (time.time() - started_at) >= startup_timeout_seconds:
+            if last_exception is None:
+                raise TimeoutError(f"Telegram API still unavailable after {startup_timeout_seconds} seconds")
+            raise TimeoutError(
+                f"Telegram API still unavailable after {startup_timeout_seconds} seconds; "
+                f"last error: {type(last_exception).__name__}: {last_exception}"
+            ) from last_exception
         time.sleep(RETRY_SLEEP_SECONDS)
 
 
@@ -250,41 +349,17 @@ def load_token(state_path: Path, legacy_token_path: Path | None = None) -> str:
             save_state(state_path, state)
             return legacy_token
 
-    raise ValueError("telegram_bot_state.json 中缺少 token")
+    raise ValueError("telegram_bot_config.json 中缺少 token")
 
 
 def queue_restart_confirmation(state_path: Path, chat_id: int, reply_to_message_id: int) -> None:
-    state = load_state(state_path)
-    state["pending_restart_notice"] = {
-        "chat_id": chat_id,
-        "reply_to_message_id": reply_to_message_id,
-        "created_at": int(time.time()),
-    }
-    save_state(state_path, state)
-
-
-def send_pending_restart_confirmation(token: str, state_path: Path, verbose: bool) -> None:
-    state = load_state(state_path)
-    notice = state.get("pending_restart_notice")
-    if not isinstance(notice, dict):
-        return
-
-    chat_id = notice.get("chat_id")
-    reply_to_message_id = notice.get("reply_to_message_id")
-    if not isinstance(chat_id, int) or not isinstance(reply_to_message_id, int):
-        state.pop("pending_restart_notice", None)
-        save_state(state_path, state)
-        return
-
-    try:
-        send_reply(token, chat_id, reply_to_message_id, "机器人已重启完成")
-        state.pop("pending_restart_notice", None)
-        save_state(state_path, state)
-        if verbose:
-            log_json({"stage": "restart_confirmed", "chat_id": chat_id, "reply_to_message_id": reply_to_message_id})
-    except Exception as exc:
-        if verbose:
-            log_json({"stage": "restart_ack_failed", "message_id": reply_to_message_id, "chat_id": chat_id, "error": str(exc)})
+    queue_pending_reply(
+        state_path,
+        chat_id,
+        reply_to_message_id,
+        "机器人已重启完成",
+        stage="restart_reply_failed",
+    )
 
 
 def build_message_reference(message: Dict[str, Any] | None) -> Dict[str, Any] | None:
@@ -502,32 +577,166 @@ def run_bridge_apply(workdir: Path, envelope: Dict[str, Any], codex_output: Dict
     return json.loads(completed.stdout.strip())
 
 
-def send_reply(token: str, chat_id: int, reply_to_message_id: int, text: str, parse_mode: str | None = None) -> Dict[str, Any]:
-    payload = {"chat_id": chat_id, "text": text, "reply_to_message_id": reply_to_message_id}
-    if parse_mode: payload["parse_mode"] = parse_mode
-    return api_request(token, "sendMessage", payload)
-
-
-def safe_send_reply(
+def send_reply(
     token: str,
     chat_id: int,
     reply_to_message_id: int,
     text: str,
-    verbose: bool,
+    parse_mode: str | None = None,
+    timeout: int = SEND_REPLY_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    payload = {"chat_id": chat_id, "text": text, "reply_to_message_id": reply_to_message_id}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return api_request(token, "sendMessage", payload, timeout=timeout)
+
+
+def send_reply_with_retry(
+    token: str,
+    chat_id: int,
+    reply_to_message_id: int,
+    text: str,
+    parse_mode: str | None = None,
+    verbose: bool = False,
+    stage: str = "reply_network_error",
+) -> Dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(1, SEND_RETRY_ATTEMPTS + 1):
+        try:
+            return send_reply(token, chat_id, reply_to_message_id, text, parse_mode=parse_mode)
+        except Exception as exc:
+            last_exc = exc
+            if verbose and attempt < SEND_RETRY_ATTEMPTS:
+                log_json(
+                    {
+                        "stage": "reply_retrying",
+                        "delivery_stage": stage,
+                        "chat_id": chat_id,
+                        "message_id": reply_to_message_id,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    }
+                )
+            if attempt < SEND_RETRY_ATTEMPTS:
+                time.sleep(SEND_RETRY_BASE_SLEEP_SECONDS ** (attempt - 1))
+
+    if last_exc is None:
+        raise RuntimeError("send_reply_with_retry failed without exception")
+    raise last_exc
+
+
+def deliver_reply(
+    runtime: RuntimeContext,
+    chat_id: int,
+    reply_to_message_id: int,
+    text: str,
     stage: str,
     parse_mode: str | None = None,
-) -> Dict[str, Any] | None:
+) -> bool:
     try:
-        return send_reply(token, chat_id, reply_to_message_id, text, parse_mode=parse_mode)
+        send_reply_with_retry(
+            runtime.token,
+            chat_id,
+            reply_to_message_id,
+            text,
+            parse_mode=parse_mode,
+            verbose=runtime.verbose,
+            stage=stage,
+        )
+        return True
     except Exception as exc:
-        if verbose:
-            log_json({
-                "stage": stage,
-                "chat_id": chat_id,
-                "message_id": reply_to_message_id,
-                "error": str(exc),
-            })
-        return None
+        queue_pending_reply(
+            runtime.state_path,
+            chat_id,
+            reply_to_message_id,
+            text,
+            stage=stage,
+            parse_mode=parse_mode,
+            error=str(exc),
+        )
+        if runtime.verbose:
+            log_json(
+                {
+                    "stage": stage,
+                    "chat_id": chat_id,
+                    "message_id": reply_to_message_id,
+                    "error": str(exc),
+                    "queued_for_retry": True,
+                }
+            )
+        return False
+
+
+def flush_pending_replies(runtime: RuntimeContext, limit: int = PENDING_REPLY_BATCH_SIZE) -> None:
+    migrate_legacy_pending_restart_notice(runtime.state_path)
+    state = load_state(runtime.state_path)
+    queue = _state_reply_queue(state)
+    if not queue:
+        return
+
+    remaining: list[Dict[str, Any]] = []
+    sent_count = 0
+    changed = False
+
+    for entry in queue:
+        if sent_count >= limit:
+            remaining.append(entry)
+            continue
+
+        chat_id = entry.get("chat_id")
+        reply_to_message_id = entry.get("reply_to_message_id")
+        text = entry.get("text")
+        parse_mode = entry.get("parse_mode") or None
+        stage = str(entry.get("stage") or "reply_network_error")
+        attempts = int(entry.get("attempts", 0))
+
+        if not isinstance(chat_id, int) or not isinstance(reply_to_message_id, int) or not isinstance(text, str) or not text:
+            changed = True
+            continue
+
+        try:
+            send_reply_with_retry(
+                runtime.token,
+                chat_id,
+                reply_to_message_id,
+                text,
+                parse_mode=parse_mode,
+                verbose=runtime.verbose,
+                stage=stage,
+            )
+            changed = True
+            sent_count += 1
+            if runtime.verbose:
+                log_json(
+                    {
+                        "stage": "pending_reply_delivered",
+                        "delivery_stage": stage,
+                        "chat_id": chat_id,
+                        "message_id": reply_to_message_id,
+                        "attempts": attempts + 1,
+                    }
+                )
+        except Exception as exc:
+            updated = dict(entry)
+            updated["attempts"] = attempts + 1
+            updated["last_error"] = str(exc)
+            updated["last_attempt_at"] = int(time.time())
+            remaining.append(updated)
+            if runtime.verbose:
+                log_json(
+                    {
+                        "stage": "pending_reply_retry_failed",
+                        "delivery_stage": stage,
+                        "chat_id": chat_id,
+                        "message_id": reply_to_message_id,
+                        "attempts": updated["attempts"],
+                        "error": str(exc),
+                    }
+                )
+
+    if changed or len(remaining) != len(queue):
+        state["pending_replies"] = remaining
+        save_state(runtime.state_path, state)
 
 
 def trigger_bot_restart(verbose: bool) -> None:
@@ -554,101 +763,161 @@ def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def handle_message(token: str, workdir: Path, state_path: Path, message: Dict[str, Any], backend: str, excel_path: Path, verbose: bool) -> None:
+def handle_restart_command(runtime: RuntimeContext, envelope: Dict[str, Any]) -> None:
+    queue_restart_confirmation(runtime.state_path, envelope["chat_id"], envelope["message_id"])
+    trigger_bot_restart(runtime.verbose)
+
+
+def handle_invalidate_command(runtime: RuntimeContext, envelope: Dict[str, Any]) -> None:
+    try:
+        result = invalidate_target_record(envelope, runtime.excel_path, runtime.backend)
+        deliver_reply(
+            runtime,
+            envelope["chat_id"],
+            envelope["message_id"],
+            f"已作废：第 {result['row']} 行（{result['sheet_name']}）",
+            "invalidate_reply_failed",
+        )
+    except Exception as exc:
+        if runtime.verbose:
+            log_json({"stage": "invalidate_error", "message_id": envelope["message_id"], "error": str(exc)})
+        deliver_reply(
+            runtime,
+            envelope["chat_id"],
+            envelope["message_id"],
+            f"作废失败：{exc}",
+            "invalidate_error_reply_failed",
+        )
+
+
+def apply_fallback_record(runtime: RuntimeContext, envelope: Dict[str, Any], ai_exc: Exception) -> tuple[Dict[str, Any], bool]:
+    if runtime.verbose:
+        log_json({"stage": "ai_failed_using_fallback", "message_id": envelope["message_id"], "error": str(ai_exc)})
+    record = get_fallback_record(envelope)
+    normalized = normalize_record(record)
+    sheet_name = record["Date"].split("-")[0]
+    row = append_record_to_excel(runtime.excel_path, normalized, sheet_name, runtime.backend)
+    return {"ok": True, "record": normalized, "sheet_name": sheet_name, "row": row, "fallback": True}, True
+
+
+def apply_bookkeeping_message(runtime: RuntimeContext, envelope: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    try:
+        prompt = run_bridge_prompt(runtime.workdir, envelope)
+        codex_output = run_codex(runtime.workdir, prompt)
+        return run_bridge_apply(runtime.workdir, envelope, codex_output, runtime.backend, runtime.excel_path), False
+    except Exception as ai_exc:
+        return apply_fallback_record(runtime, envelope, ai_exc)
+
+
+def build_success_reply(apply_result: Dict[str, Any], fallback_used: bool) -> str:
+    record = apply_result["record"]
+    if fallback_used:
+        return (
+            "⚠️ AI 处理失败，已为您自动记录原文：\n"
+            f"{record['Type']} / {record['Category']} / {record['Amount']}\n"
+            f"备注：{record['Note']}\n"
+            f"请稍后手动核对（第 {apply_result['row']} 行）"
+        )
+
+    confirm_hint = "，待确认" if record.get("Status") == STATUS_PENDING else ""
+    reply = f"已记账：{record['Type']} / {record['Category']} / {record['Amount']}"
+    if record["Note"]:
+        reply += f" / {record['Note']}"
+    reply += f"，第 {apply_result['row']} 行{confirm_hint}"
+    return reply
+
+
+def handle_bookkeeping_message(runtime: RuntimeContext, envelope: Dict[str, Any]) -> None:
+    apply_result, fallback_used = apply_bookkeeping_message(runtime, envelope)
+    if runtime.verbose:
+        log_json({"stage": "applied", "message_id": envelope["message_id"], "result": apply_result})
+    if apply_result.get("ignored"):
+        deliver_reply(
+            runtime,
+            envelope["chat_id"],
+            envelope["message_id"],
+            f"已忽略：{apply_result.get('reason', '不是记账相关消息')}",
+            "ignored_reply_failed",
+        )
+        return
+
+    try:
+        register_record_mapping(envelope, apply_result)
+    except Exception as idx_exc:
+        if runtime.verbose:
+            log_json({"stage": "index_error", "message_id": envelope["message_id"], "error": str(idx_exc)})
+
+    reply = build_success_reply(apply_result, fallback_used)
+    deliver_reply(runtime, envelope["chat_id"], envelope["message_id"], reply, "reply_network_error")
+
+
+def handle_message(runtime: RuntimeContext, message: Dict[str, Any]) -> None:
     envelope = build_envelope(message)
     if envelope["text"] == "重启":
-        queue_restart_confirmation(state_path, envelope["chat_id"], envelope["message_id"])
-        safe_send_reply(token, envelope["chat_id"], envelope["message_id"], "正在重启机器人", verbose, "restart_reply_failed")
-        trigger_bot_restart(verbose)
+        handle_restart_command(runtime, envelope)
         return
 
     if envelope["text"] == "作废":
-        try:
-            result = invalidate_target_record(envelope, excel_path, backend)
-            safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"已作废：第 {result['row']} 行（{result['sheet_name']}）", verbose, "invalidate_reply_failed")
-        except Exception as exc:
-            if verbose: log_json({"stage": "invalidate_error", "message_id": envelope["message_id"], "error": str(exc)})
-            safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"作废失败：{exc}", verbose, "invalidate_error_reply_failed")
+        handle_invalidate_command(runtime, envelope)
         return
 
-    safe_send_reply(token, envelope["chat_id"], envelope["message_id"], "正在处理...", verbose, "processing_reply_failed")
-
-    apply_result = None
-    fallback_used = False
     try:
-        try:
-            prompt = run_bridge_prompt(workdir, envelope)
-            codex_output = run_codex(workdir, prompt)
-            apply_result = run_bridge_apply(workdir, envelope, codex_output, backend, excel_path)
-        except Exception as ai_exc:
-            if verbose: log_json({"stage": "ai_failed_using_fallback", "message_id": envelope["message_id"], "error": str(ai_exc)})
-            record = get_fallback_record(envelope)
-            normalized = normalize_record(record)
-            sheet_name = record["Date"].split("-")[0]
-            row = append_record_to_excel(excel_path, normalized, sheet_name, backend)
-            apply_result = {"ok": True, "record": normalized, "sheet_name": sheet_name, "row": row, "fallback": True}
-            fallback_used = True
-
-        if verbose: log_json({"stage": "applied", "message_id": envelope["message_id"], "result": apply_result})
-        if apply_result.get("ignored"):
-            safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"已忽略：{apply_result.get('reason', '不是记账相关消息')}", verbose, "ignored_reply_failed")
-            return
-
-        try: register_record_mapping(envelope, apply_result)
-        except Exception as idx_exc:
-            if verbose: log_json({"stage": "index_error", "message_id": envelope["message_id"], "error": str(idx_exc)})
-
-        r = apply_result["record"]
-        if fallback_used:
-            reply = f"⚠️ AI 处理失败，已为您自动记录原文：\n{r['Type']} / {r['Category']} / {r['Amount']}\n备注：{r['Note']}\n请稍后手动核对（第 {apply_result['row']} 行）"
-        else:
-            confirm_hint = "，待确认" if r.get("Status") == STATUS_PENDING else ""
-            reply = f"已记账：{r['Type']} / {r['Category']} / {r['Amount']}"
-            if r['Note']: reply += f" / {r['Note']}"
-            reply += f"，第 {apply_result['row']} 行{confirm_hint}"
-        
-        safe_send_reply(token, envelope["chat_id"], envelope["message_id"], reply, verbose, "reply_network_error")
+        handle_bookkeeping_message(runtime, envelope)
     except Exception as exc:
-        if verbose: log_json({"stage": "critical_error", "message_id": envelope.get("message_id"), "error": str(exc)})
-        safe_send_reply(token, envelope["chat_id"], envelope["message_id"], f"系统故障，无法记账：{exc}", verbose, "critical_error_reply_failed")
+        if runtime.verbose:
+            log_json({"stage": "critical_error", "message_id": envelope.get("message_id"), "error": str(exc)})
+        deliver_reply(
+            runtime,
+            envelope["chat_id"],
+            envelope["message_id"],
+            f"系统故障，无法记账：{exc}",
+            "critical_error_reply_failed",
+        )
 
 
-def poll_loop(token: str, workdir: Path, state_path: Path, allowed_username: str, backend: str, excel_path: Path, verbose: bool) -> None:
-    state = load_state(state_path)
+def save_offset(state_path: Path, offset: int) -> None:
+    update_state(state_path, offset=offset)
+
+
+def poll_loop(runtime: RuntimeContext) -> None:
+    state = load_state(runtime.state_path)
     offset = int(state.get("offset", 0))
     outage_started_at: float | None = None
     last_logged_at: float | None = None
     while True:
         try:
-            refresh_report_if_period_changed(state_path, excel_path, verbose)
-            state = load_state(state_path)
-            state["offset"] = offset
-            result = api_request(token, "getUpdates", {"offset": offset, "timeout": API_TIMEOUT_SECONDS, "allowed_updates": ["message"]}, timeout=API_TIMEOUT_SECONDS + 10)
-            log_network_recovered(verbose, outage_started_at)
+            refresh_report_if_period_changed(runtime.state_path, runtime.excel_path, runtime.verbose)
+            flush_pending_replies(runtime)
+            result = api_request(runtime.token, "getUpdates", {"offset": offset, "timeout": API_TIMEOUT_SECONDS, "allowed_updates": ["message"]}, timeout=API_TIMEOUT_SECONDS + 10)
+            log_network_recovered(runtime.verbose, outage_started_at)
             outage_started_at = None
             last_logged_at = None
             for update in result.get("result", []):
                 update_id = int(update["update_id"])
                 offset = update_id + 1
-                state = load_state(state_path)
-                state["offset"] = offset
-                save_state(state_path, state)
+                save_offset(runtime.state_path, offset)
                 message = update.get("message")
-                if not message: continue
-                accepted, reason = should_process(message, allowed_username)
-                if verbose: log_json({"stage": "received", "accepted": accepted, "reason": reason, "text": (message.get("text") or "")[:40]})
-                if not accepted: continue
-                try: handle_message(token, workdir, state_path, message, backend, excel_path, verbose)
-                except Exception as exc: log_json({"stage": "handle_message_crash", "error": str(exc)})
+                if not message:
+                    continue
+                accepted, reason = should_process(message, runtime.allowed_username)
+                if runtime.verbose:
+                    log_json({"stage": "received", "accepted": accepted, "reason": reason, "text": (message.get("text") or "")[:40]})
+                if not accepted:
+                    continue
+                try:
+                    handle_message(runtime, message)
+                except Exception as exc:
+                    log_json({"stage": "handle_message_crash", "error": str(exc)})
         except urllib.error.HTTPError as exc:
-            if exc.code == 401: raise RuntimeError("Unauthorized bot token") from exc
-            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_error", exc)
+            if exc.code == 401:
+                raise RuntimeError("Unauthorized bot token") from exc
+            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "network_error", exc)
             time.sleep(RETRY_SLEEP_SECONDS)
         except urllib.error.URLError as exc:
-            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_error", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "network_error", exc)
             time.sleep(RETRY_SLEEP_SECONDS)
         except Exception as exc:
-            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "loop_error", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "loop_error", exc)
             time.sleep(RETRY_SLEEP_SECONDS)
 
 
@@ -660,18 +929,31 @@ def main() -> int:
     parser.add_argument("--backend", choices=["win32com", "openpyxl"], default="openpyxl")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--startup-timeout-seconds", type=int, default=0)
     args = parser.parse_args()
     workdir = BASE_DIR
     state_path = Path(args.state_file)
     state = load_state(state_path)
     excel_path = Path(args.excel_path) if str(args.excel_path).strip() else configured_excel_path(state)
     token = load_token(state_path, Path(args.legacy_token_file))
-    me = wait_until_telegram_ready(token, args.verbose)
-    if args.verbose: log_json({"stage": "getMe", "result": me["result"]})
-    send_pending_restart_confirmation(token, state_path, args.verbose)
-    if args.once: return 0
+    me = wait_until_telegram_ready(token, args.verbose, startup_timeout_seconds=args.startup_timeout_seconds)
+    runtime = RuntimeContext(
+        token=token,
+        workdir=workdir,
+        state_path=state_path,
+        allowed_username=configured_allowed_username(state),
+        backend=args.backend,
+        excel_path=excel_path,
+        verbose=args.verbose,
+    )
+    if args.verbose:
+        log_json({"stage": "getMe", "result": me["result"]})
+    if args.once:
+        return 0
+    migrate_legacy_pending_restart_notice(state_path)
+    flush_pending_replies(runtime)
     refresh_report_if_period_changed(state_path, excel_path, args.verbose)
-    poll_loop(token, workdir, state_path, configured_allowed_username(state), args.backend, excel_path, args.verbose)
+    poll_loop(runtime)
     return 0
 
 if __name__ == "__main__":
