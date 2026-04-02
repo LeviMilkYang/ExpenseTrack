@@ -34,6 +34,7 @@ EXPECTED_HEADERS = [
     "Type",
     "Category",
     "Note",
+    "PaymentChannel",
     "Status",
 ]
 
@@ -47,6 +48,7 @@ FIELD_ALIASES = {
     "Type": ("Type", "type", "收支"),
     "Category": ("Category", "category", "分类"),
     "Note": ("Note", "note", "备注"),
+    "PaymentChannel": ("PaymentChannel", "payment_channel", "支付渠道"),
     "Status": ("Status", "status", "状态", "NeedConfirm", "need_confirm", "待确认"),
 }
 
@@ -105,12 +107,14 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from openpyxl import load_workbook
 
-EXPECTED_HEADERS = ["ID", "Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "Status"]
-LEGACY_HEADERS = ["ID", "Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+EXPECTED_HEADERS = ["ID", "Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "PaymentChannel", "Status"]
+LEGACY_HEADERS = ["ID", "Date", "Time", "Timezone", "Amount", "Currency", "Type", "Category", "Note", "Status"]
+EARLY_LEGACY_HEADERS = ["ID", "Date", "Time", "Amount", "Currency", "Type", "Category", "Note", "Status"]
 ID_COL = EXPECTED_HEADERS.index("ID") + 1
 DATE_COL = EXPECTED_HEADERS.index("Date") + 1
 TIME_COL = EXPECTED_HEADERS.index("Time") + 1
 TIMEZONE_COL = EXPECTED_HEADERS.index("Timezone") + 1
+PAYMENT_CHANNEL_COL = EXPECTED_HEADERS.index("PaymentChannel") + 1
 STATUS_COL = EXPECTED_HEADERS.index("Status") + 1
 
 
@@ -145,6 +149,37 @@ def find_row_by_id(worksheet, record_id: str) -> int:
         if str(worksheet.cell(row=row, column=ID_COL).value) == str(record_id):
             return row
     raise ValueError(f"未找到 ID 为 {record_id} 的记录")
+
+
+def read_headers(worksheet, count: int) -> list[object]:
+    return [worksheet.cell(row=1, column=i).value for i in range(1, count + 1)]
+
+
+def ensure_headers(worksheet):
+    actual_headers = read_headers(worksheet, len(EXPECTED_HEADERS))
+    if actual_headers == EXPECTED_HEADERS:
+        return
+
+    legacy_headers = read_headers(worksheet, len(LEGACY_HEADERS))
+    early_legacy_headers = read_headers(worksheet, len(EARLY_LEGACY_HEADERS))
+    if legacy_headers == LEGACY_HEADERS:
+        worksheet.insert_cols(PAYMENT_CHANNEL_COL, amount=1)
+        worksheet.cell(row=1, column=PAYMENT_CHANNEL_COL, value="PaymentChannel")
+        return
+
+    if early_legacy_headers == EARLY_LEGACY_HEADERS:
+        worksheet.insert_cols(TIMEZONE_COL, amount=1)
+        worksheet.cell(row=1, column=TIMEZONE_COL, value="Timezone")
+        worksheet.insert_cols(PAYMENT_CHANNEL_COL, amount=1)
+        worksheet.cell(row=1, column=PAYMENT_CHANNEL_COL, value="PaymentChannel")
+        return
+
+    if actual_headers[:2] == [None, None] or actual_headers[0] != "ID":
+        for col, header in enumerate(EXPECTED_HEADERS, start=1):
+            worksheet.cell(row=1, column=col, value=header)
+        return
+
+    raise ValueError(f"Header mismatch: {actual_headers}")
 
 
 def normalize_timezone(value) -> str:
@@ -222,11 +257,12 @@ def sort_worksheet(worksheet):
 
     for i, row_data in enumerate(rows, start=2):
         for j, val in enumerate(row_data, start=1):
-            worksheet.cell(row=i, column=j, value=val)
+            cell = worksheet.cell(row=i, column=j)
+            cell.value = val
             if j == DATE_COL:
-                worksheet.cell(row=i, column=j).number_format = "yyyy-mm-dd"
+                cell.number_format = "yyyy-mm-dd"
             elif j == TIME_COL:
-                worksheet.cell(row=i, column=j).number_format = "hh:mm"
+                cell.number_format = "hh:mm"
 
 
 def main() -> int:
@@ -241,17 +277,7 @@ def main() -> int:
     workbook = load_workbook(excel_path)
     worksheet = workbook[sheet_name] if sheet_name else workbook.worksheets[0]
 
-    actual_headers = [worksheet.cell(row=1, column=i).value for i in range(1, len(EXPECTED_HEADERS) + 1)]
-    if actual_headers != EXPECTED_HEADERS:
-        legacy_headers = [worksheet.cell(row=1, column=i).value for i in range(1, len(LEGACY_HEADERS) + 1)]
-        if legacy_headers == LEGACY_HEADERS:
-            worksheet.insert_cols(TIMEZONE_COL, amount=1)
-            worksheet.cell(row=1, column=TIMEZONE_COL, value="Timezone")
-        elif actual_headers[:2] == [None, None] or actual_headers[0] != "ID":
-            for col, header in enumerate(EXPECTED_HEADERS, start=1):
-                worksheet.cell(row=1, column=col, value=header)
-        else:
-            raise ValueError(f"Header mismatch: {actual_headers}")
+    ensure_headers(worksheet)
 
     if action == "append":
         last_row = find_last_non_empty_row(worksheet) or 1
@@ -315,11 +341,27 @@ def _pick_value(record: Dict[str, Any], field: str) -> Any:
     return None
 
 
-def get_allowed_categories(config_path: Path = DEFAULT_CONFIG_PATH) -> set[str]:
+def _clean_config_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def load_bot_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     if not config_path.exists():
-        return set(DEFAULT_ALLOWED_CATEGORIES)
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    return {str(item).strip() for item in config.get("allowed_categories", []) if str(item).strip()}
+        return {}
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def get_allowed_categories(config: Dict[str, Any] | None = None, config_path: Path = DEFAULT_CONFIG_PATH) -> set[str]:
+    loaded_config = config if config is not None else load_bot_config(config_path)
+    categories = _clean_config_list(loaded_config.get("allowed_categories"))
+    return set(categories or DEFAULT_ALLOWED_CATEGORIES)
+
+
+def get_payment_channels(config: Dict[str, Any] | None = None, config_path: Path = DEFAULT_CONFIG_PATH) -> list[str]:
+    loaded_config = config if config is not None else load_bot_config(config_path)
+    return _clean_config_list(loaded_config.get("payment_channels"))
 
 
 def normalize_status(raw_value: Any) -> str:
@@ -393,7 +435,7 @@ def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for field in EXPECTED_HEADERS:
         value = _pick_value(record, field)
-        if field not in ("Status", "Note") and value is None:
+        if field not in ("Status", "Note", "PaymentChannel") and value is None:
              # ID 必须有
              if field == "ID":
                  raise ValueError("缺少必填字段: ID")

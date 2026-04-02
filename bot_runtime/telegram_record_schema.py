@@ -14,6 +14,7 @@ RECORD_REQUIRED_FIELDS = [
     "Type",
     "Category",
     "Note",
+    "PaymentChannel",
     "Status",
 ]
 
@@ -29,6 +30,7 @@ RECORD_PROPERTIES: Dict[str, Any] = {
     "Type": {"type": "string", "enum": ["收入", "支出", "借入", "贷出", "收回", "偿还"]},
     "Category": {"type": "string"},
     "Note": {"type": "string"},
+    "PaymentChannel": {"type": "string"},
     "Status": {"type": "string"},
 }
 

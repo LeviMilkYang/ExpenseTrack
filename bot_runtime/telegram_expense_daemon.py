@@ -21,6 +21,7 @@ from append_excel_entry import (
     append_record_to_excel,
     convert_telegram_timestamp,
     invalidate_record_by_id,
+    load_bot_config,
     normalize_record,
     read_record_by_id,
 )
@@ -47,6 +48,7 @@ class RuntimeContext:
     workdir: Path
     state_path: Path
     allowed_username: str
+    bot_config: Dict[str, Any]
     backend: str
     excel_path: Path
     verbose: bool
@@ -501,8 +503,9 @@ def invalidate_target_record(envelope: Dict[str, Any], excel_path: Path, backend
 
 
 def run_bridge_prompt(workdir: Path, envelope: Dict[str, Any]) -> str:
+    payload = dict(envelope)
     completed = subprocess.run(
-        ["python3", str(workdir / "telegram_codex_bridge.py"), "prompt", "--json", json.dumps(envelope, ensure_ascii=False)],
+        ["python3", str(workdir / "telegram_codex_bridge.py"), "prompt", "--json", json.dumps(payload, ensure_ascii=False)],
         cwd=workdir, capture_output=True, text=True, check=True
     )
     output = completed.stdout.strip()
@@ -768,6 +771,7 @@ def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "Type": "支出",
         "Category": "未分类",
         "Note": f"[AI失败兜底] {envelope['text']}",
+        "PaymentChannel": "",
         "Status": "待确认",
     }
 
@@ -820,9 +824,11 @@ def apply_fallback_record(runtime: RuntimeContext, envelope: Dict[str, Any], ai_
 
 def apply_bookkeeping_message(runtime: RuntimeContext, envelope: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
     try:
-        prompt = run_bridge_prompt(runtime.workdir, envelope)
+        payload = dict(envelope)
+        payload["runtime_config"] = runtime.bot_config
+        prompt = run_bridge_prompt(runtime.workdir, payload)
         codex_output = run_codex(runtime.workdir, prompt)
-        return run_bridge_apply(runtime.workdir, envelope, codex_output, runtime.backend, runtime.excel_path), False
+        return run_bridge_apply(runtime.workdir, payload, codex_output, runtime.backend, runtime.excel_path), False
     except Exception as ai_exc:
         return apply_fallback_record(runtime, envelope, ai_exc)
 
@@ -980,6 +986,7 @@ def main() -> int:
     workdir = BASE_DIR
     state_path = Path(args.state_file)
     state = load_state(state_path)
+    bot_config = load_bot_config(state_path)
     excel_path = Path(args.excel_path) if str(args.excel_path).strip() else configured_excel_path(state)
     token = load_token(state_path, Path(args.legacy_token_file))
     me = wait_until_telegram_ready(token, args.verbose, startup_timeout_seconds=args.startup_timeout_seconds)
@@ -988,6 +995,7 @@ def main() -> int:
         workdir=workdir,
         state_path=state_path,
         allowed_username=configured_allowed_username(state),
+        bot_config=bot_config,
         backend=args.backend,
         excel_path=excel_path,
         verbose=args.verbose,

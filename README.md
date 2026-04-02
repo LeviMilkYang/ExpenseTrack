@@ -29,6 +29,7 @@
 - `allowed_username`：白名单 Telegram 用户名
 - `project_dir`：项目根目录绝对路径，用来推导 `expense.xlsx` 和 `expense_report.xlsx`
 - `allowed_categories`：合法收支分类集合
+- `payment_channels`：合法支付渠道集合，daemon 启动时一次性加载到内存
 
 ## 核心特性
 

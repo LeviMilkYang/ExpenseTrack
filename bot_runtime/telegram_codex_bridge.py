@@ -12,6 +12,7 @@ from append_excel_entry import (
     append_record_to_excel,
     convert_telegram_timestamp,
     get_allowed_categories,
+    get_payment_channels,
     normalize_record,
     normalize_timezone,
 )
@@ -37,6 +38,7 @@ PROMPT_RECORD_SHAPE: Dict[str, Any] = {
     "Type": "allowed type value",
     "Category": "string",
     "Note": "string",
+    "PaymentChannel": "configured payment channel or empty string",
     "Status": "",
 }
 
@@ -59,6 +61,8 @@ Rules:
 11. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
 12. For normal income/expense, `Category` must be one of: {categories}.
 13. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
+14. `PaymentChannel` must be one of: {payment_channels}. If the user did not explicitly mention a payment channel, return an empty string.
+15. Only fill `PaymentChannel` when the message explicitly indicates the channel. Do not guess.
 
 Telegram envelope:
 {envelope}
@@ -94,6 +98,11 @@ def _message_text(payload: Dict[str, Any]) -> str:
         value = payload.get(key)
         if value is not None: return str(value).strip()
     return ""
+
+
+def _runtime_config(payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    runtime_config = payload.get("runtime_config")
+    return runtime_config if isinstance(runtime_config, dict) else None
 
 
 def _coerce_record(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -140,6 +149,8 @@ def _fill_defaults(record: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str,
         merged["Time"] = tg_time
 
     if not str(merged.get("Currency", "")).strip(): merged["Currency"] = "CNY"
+    if "PaymentChannel" not in merged or merged.get("PaymentChannel") is None:
+        merged["PaymentChannel"] = ""
     if "Status" not in merged: merged["Status"] = ""
     return merged
 
@@ -152,6 +163,9 @@ def _sheet_name_for_record(record: Dict[str, Any], explicit_sheet_name: str | No
 
 
 def emit_prompt(payload: Dict[str, Any]) -> str:
+    runtime_config = _runtime_config(payload)
+    allowed_categories = sorted(get_allowed_categories(config=runtime_config))
+    payment_channels = get_payment_channels(config=runtime_config)
     minimal_envelope = {
         "message_id": payload.get("message_id"),
         "chat_id": payload.get("chat_id"),
@@ -160,7 +174,8 @@ def emit_prompt(payload: Dict[str, Any]) -> str:
         "text": _message_text(payload),
     }
     return PROMPT_TEMPLATE.format(
-        categories="|".join(sorted(get_allowed_categories())),
+        categories="|".join(allowed_categories),
+        payment_channels="|".join(payment_channels) if payment_channels else "(none configured)",
         output_shape=json.dumps(PROMPT_OUTPUT_SHAPE, ensure_ascii=False),
         record_shape=json.dumps(PROMPT_RECORD_SHAPE, ensure_ascii=False),
         envelope=json.dumps(minimal_envelope, ensure_ascii=False),
