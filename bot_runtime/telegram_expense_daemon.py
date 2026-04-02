@@ -119,18 +119,15 @@ def maybe_log_network_outage(
     return outage_started_at, last_logged_at
 
 
-def log_network_recovered(verbose: bool, outage_started_at: float | None) -> None:
-    if not verbose or outage_started_at is None:
-        return
-
-    recovered_at = time.time()
-    log_json(
-        {
-            "stage": "network_recovered",
-            "outage_started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outage_started_at)),
-            "outage_duration_seconds": int(recovered_at - outage_started_at),
-        }
-    )
+def log_message_event(stage: str, envelope: Dict[str, Any], **extra: Any) -> None:
+    payload: Dict[str, Any] = {
+        "stage": stage,
+        "chat_id": envelope.get("chat_id"),
+        "message_id": envelope.get("message_id"),
+        "text": envelope.get("text", "")[:80],
+    }
+    payload.update(extra)
+    log_json(payload)
 
 
 def api_request(token: str, method: str, payload: Dict[str, Any] | None = None, timeout: int = 30) -> Dict[str, Any]:
@@ -158,14 +155,6 @@ def load_state(state_path: Path) -> Dict[str, Any]:
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def update_state(state_path: Path, **changes: Any) -> Dict[str, Any]:
-    state = load_state(state_path)
-    state.update(changes)
-    save_state(state_path, state)
-    return state
-
 
 def _state_reply_queue(state: Dict[str, Any]) -> list[Dict[str, Any]]:
     queue = state.get("pending_replies")
@@ -312,19 +301,26 @@ def wait_until_telegram_ready(token: str, verbose: bool, startup_timeout_seconds
     while True:
         try:
             result = api_request(token, "getMe")
-            log_network_recovered(verbose, outage_started_at)
+            if verbose and outage_started_at is not None:
+                log_json(
+                    {
+                        "stage": "startup_network_recovered",
+                        "outage_started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outage_started_at)),
+                        "outage_duration_seconds": int(time.time() - outage_started_at),
+                    }
+                )
             return result
         except urllib.error.HTTPError as exc:
             last_exception = exc
             if exc.code == 401:
                 raise RuntimeError("Unauthorized bot token") from exc
-            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "startup_network_error", exc)
         except urllib.error.URLError as exc:
             last_exception = exc
-            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "startup_network_error", exc)
         except Exception as exc:
             last_exception = exc
-            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "network_waiting_for_telegram", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(verbose, outage_started_at, last_logged_at, "startup_network_error", exc)
 
         if startup_timeout_seconds > 0 and (time.time() - started_at) >= startup_timeout_seconds:
             if last_exception is None:
@@ -609,12 +605,13 @@ def send_reply_with_retry(
             if verbose and attempt < SEND_RETRY_ATTEMPTS:
                 log_json(
                     {
-                        "stage": "reply_retrying",
+                        "stage": "reply_network_error",
                         "delivery_stage": stage,
                         "chat_id": chat_id,
                         "message_id": reply_to_message_id,
                         "attempt": attempt,
                         "error": str(exc),
+                        "will_retry": True,
                     }
                 )
             if attempt < SEND_RETRY_ATTEMPTS:
@@ -643,6 +640,15 @@ def deliver_reply(
             verbose=runtime.verbose,
             stage=stage,
         )
+        if runtime.verbose:
+            log_json(
+                {
+                    "stage": "message_reply_sent",
+                    "delivery_stage": stage,
+                    "chat_id": chat_id,
+                    "message_id": reply_to_message_id,
+                }
+            )
         return True
     except Exception as exc:
         queue_pending_reply(
@@ -657,7 +663,8 @@ def deliver_reply(
         if runtime.verbose:
             log_json(
                 {
-                    "stage": stage,
+                    "stage": "message_reply_failed",
+                    "delivery_stage": stage,
                     "chat_id": chat_id,
                     "message_id": reply_to_message_id,
                     "error": str(exc),
@@ -709,11 +716,12 @@ def flush_pending_replies(runtime: RuntimeContext, limit: int = PENDING_REPLY_BA
             if runtime.verbose:
                 log_json(
                     {
-                        "stage": "pending_reply_delivered",
+                        "stage": "message_reply_sent",
                         "delivery_stage": stage,
                         "chat_id": chat_id,
                         "message_id": reply_to_message_id,
                         "attempts": attempts + 1,
+                        "from_pending_queue": True,
                     }
                 )
         except Exception as exc:
@@ -725,12 +733,13 @@ def flush_pending_replies(runtime: RuntimeContext, limit: int = PENDING_REPLY_BA
             if runtime.verbose:
                 log_json(
                     {
-                        "stage": "pending_reply_retry_failed",
+                        "stage": "reply_network_error",
                         "delivery_stage": stage,
                         "chat_id": chat_id,
                         "message_id": reply_to_message_id,
                         "attempts": updated["attempts"],
                         "error": str(exc),
+                        "from_pending_queue": True,
                     }
                 )
 
@@ -771,6 +780,15 @@ def handle_restart_command(runtime: RuntimeContext, envelope: Dict[str, Any]) ->
 def handle_invalidate_command(runtime: RuntimeContext, envelope: Dict[str, Any]) -> None:
     try:
         result = invalidate_target_record(envelope, runtime.excel_path, runtime.backend)
+        if runtime.verbose:
+            log_message_event(
+                "message_applied",
+                envelope,
+                operation="invalidate",
+                sheet_name=result.get("sheet_name"),
+                row=result.get("row"),
+                target_record_id=result.get("target_record_id"),
+            )
         deliver_reply(
             runtime,
             envelope["chat_id"],
@@ -792,7 +810,7 @@ def handle_invalidate_command(runtime: RuntimeContext, envelope: Dict[str, Any])
 
 def apply_fallback_record(runtime: RuntimeContext, envelope: Dict[str, Any], ai_exc: Exception) -> tuple[Dict[str, Any], bool]:
     if runtime.verbose:
-        log_json({"stage": "ai_failed_using_fallback", "message_id": envelope["message_id"], "error": str(ai_exc)})
+        log_message_event("message_processing_fallback", envelope, error=str(ai_exc))
     record = get_fallback_record(envelope)
     normalized = normalize_record(record)
     sheet_name = record["Date"].split("-")[0]
@@ -830,7 +848,13 @@ def build_success_reply(apply_result: Dict[str, Any], fallback_used: bool) -> st
 def handle_bookkeeping_message(runtime: RuntimeContext, envelope: Dict[str, Any]) -> None:
     apply_result, fallback_used = apply_bookkeeping_message(runtime, envelope)
     if runtime.verbose:
-        log_json({"stage": "applied", "message_id": envelope["message_id"], "result": apply_result})
+        log_message_event(
+            "message_applied",
+            envelope,
+            operation="bookkeeping",
+            result=apply_result,
+            fallback_used=fallback_used,
+        )
     if apply_result.get("ignored"):
         deliver_reply(
             runtime,
@@ -853,6 +877,14 @@ def handle_bookkeeping_message(runtime: RuntimeContext, envelope: Dict[str, Any]
 
 def handle_message(runtime: RuntimeContext, message: Dict[str, Any]) -> None:
     envelope = build_envelope(message)
+    operation = "bookkeeping"
+    if envelope["text"] == "重启":
+        operation = "restart"
+    elif envelope["text"] == "作废":
+        operation = "invalidate"
+    if runtime.verbose:
+        log_message_event("message_processing_started", envelope, operation=operation)
+
     if envelope["text"] == "重启":
         handle_restart_command(runtime, envelope)
         return
@@ -865,7 +897,7 @@ def handle_message(runtime: RuntimeContext, message: Dict[str, Any]) -> None:
         handle_bookkeeping_message(runtime, envelope)
     except Exception as exc:
         if runtime.verbose:
-            log_json({"stage": "critical_error", "message_id": envelope.get("message_id"), "error": str(exc)})
+            log_message_event("message_processing_failed", envelope, error=str(exc), operation=operation)
         deliver_reply(
             runtime,
             envelope["chat_id"],
@@ -876,7 +908,9 @@ def handle_message(runtime: RuntimeContext, message: Dict[str, Any]) -> None:
 
 
 def save_offset(state_path: Path, offset: int) -> None:
-    update_state(state_path, offset=offset)
+    state = load_state(state_path)
+    state["offset"] = offset
+    save_state(state_path, state)
 
 
 def poll_loop(runtime: RuntimeContext) -> None:
@@ -889,7 +923,14 @@ def poll_loop(runtime: RuntimeContext) -> None:
             refresh_report_if_period_changed(runtime.state_path, runtime.excel_path, runtime.verbose)
             flush_pending_replies(runtime)
             result = api_request(runtime.token, "getUpdates", {"offset": offset, "timeout": API_TIMEOUT_SECONDS, "allowed_updates": ["message"]}, timeout=API_TIMEOUT_SECONDS + 10)
-            log_network_recovered(runtime.verbose, outage_started_at)
+            if outage_started_at is not None and runtime.verbose:
+                log_json(
+                    {
+                        "stage": "poll_network_recovered",
+                        "outage_started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outage_started_at)),
+                        "outage_duration_seconds": int(time.time() - outage_started_at),
+                    }
+                )
             outage_started_at = None
             last_logged_at = None
             for update in result.get("result", []):
@@ -901,7 +942,12 @@ def poll_loop(runtime: RuntimeContext) -> None:
                     continue
                 accepted, reason = should_process(message, runtime.allowed_username)
                 if runtime.verbose:
-                    log_json({"stage": "received", "accepted": accepted, "reason": reason, "text": (message.get("text") or "")[:40]})
+                    log_message_event(
+                        "message_received",
+                        build_envelope(message),
+                        accepted=accepted,
+                        reason=reason,
+                    )
                 if not accepted:
                     continue
                 try:
@@ -911,13 +957,13 @@ def poll_loop(runtime: RuntimeContext) -> None:
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 raise RuntimeError("Unauthorized bot token") from exc
-            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "network_error", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "poll_network_error", exc)
             time.sleep(RETRY_SLEEP_SECONDS)
         except urllib.error.URLError as exc:
-            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "network_error", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "poll_network_error", exc)
             time.sleep(RETRY_SLEEP_SECONDS)
         except Exception as exc:
-            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "loop_error", exc)
+            outage_started_at, last_logged_at = maybe_log_network_outage(runtime.verbose, outage_started_at, last_logged_at, "poll_loop_error", exc)
             time.sleep(RETRY_SLEEP_SECONDS)
 
 
@@ -947,7 +993,7 @@ def main() -> int:
         verbose=args.verbose,
     )
     if args.verbose:
-        log_json({"stage": "getMe", "result": me["result"]})
+        log_json({"stage": "startup_ready", "result": me["result"]})
     if args.once:
         return 0
     migrate_legacy_pending_restart_notice(state_path)

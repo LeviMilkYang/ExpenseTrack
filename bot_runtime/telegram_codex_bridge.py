@@ -15,7 +15,6 @@ from append_excel_entry import (
     normalize_record,
     normalize_timezone,
 )
-from telegram_record_schema import CODEX_OUTPUT_SCHEMA
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
