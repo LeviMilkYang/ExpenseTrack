@@ -215,54 +215,56 @@ def timezone_to_tzinfo(value) -> timezone:
     return timezone(sign * timedelta(hours=hours, minutes=minutes))
 
 
-def sort_worksheet(worksheet):
-    # 简单的冒泡或提取重写排序。对于 Excel 脚本，提取所有数据排序后再写回最稳妥。
-    rows = []
+def row_utc_datetime(row) -> datetime:
+    d = row[DATE_COL - 1]
+    t = row[TIME_COL - 1]
+    tz_value = row[TIMEZONE_COL - 1]
+
+    if isinstance(d, str):
+        try:
+            d_obj = datetime.strptime(d, "%Y-%m-%d").date()
+        except:
+            d_obj = date(1970, 1, 1)
+    elif isinstance(d, datetime):
+        d_obj = d.date()
+    else:
+        d_obj = d or date(1970, 1, 1)
+
+    if isinstance(t, str):
+        try:
+            t_obj = datetime.strptime(t, "%H:%M").time()
+        except:
+            t_obj = dt_time(0, 0)
+    elif isinstance(t, datetime):
+        t_obj = t.time()
+    else:
+        t_obj = t or dt_time(0, 0)
+
+    local_dt = datetime.combine(d_obj, t_obj, tzinfo=timezone_to_tzinfo(tz_value))
+    return local_dt.astimezone(timezone.utc)
+
+
+def find_insert_row(worksheet, record) -> int:
+    target_dt = row_utc_datetime([record[header] for header in EXPECTED_HEADERS])
     last_row = find_last_non_empty_row(worksheet)
     if not last_row or last_row < 2:
-        return
+        return 2
 
-    for r in range(2, last_row + 1):
-        rows.append(row_values(worksheet, r))
+    for row in range(last_row, 1, -1):
+        values = row_values(worksheet, row)
+        if not any(value not in (None, "") for value in values):
+            continue
+        if row_utc_datetime(values) <= target_dt:
+            return row + 1
+    return 2
 
-    def sort_key(row):
-        d = row[DATE_COL-1]
-        t = row[TIME_COL-1]
-        tz_value = row[TIMEZONE_COL-1]
 
-        if isinstance(d, str):
-            try:
-                d_obj = datetime.strptime(d, "%Y-%m-%d").date()
-            except:
-                d_obj = date(1970, 1, 1)
-        elif isinstance(d, datetime):
-            d_obj = d.date()
-        else:
-            d_obj = d or date(1970, 1, 1)
+def write_record(worksheet, target_row: int, record) -> None:
+    for col, header in enumerate(EXPECTED_HEADERS, start=1):
+        worksheet.cell(row=target_row, column=col, value=record[header])
 
-        if isinstance(t, str):
-            try:
-                t_obj = datetime.strptime(t, "%H:%M").time()
-            except:
-                t_obj = dt_time(0, 0)
-        elif isinstance(t, datetime):
-            t_obj = t.time()
-        else:
-            t_obj = t or dt_time(0, 0)
-
-        local_dt = datetime.combine(d_obj, t_obj, tzinfo=timezone_to_tzinfo(tz_value))
-        return local_dt.astimezone(timezone.utc)
-
-    rows.sort(key=sort_key)
-
-    for i, row_data in enumerate(rows, start=2):
-        for j, val in enumerate(row_data, start=1):
-            cell = worksheet.cell(row=i, column=j)
-            cell.value = val
-            if j == DATE_COL:
-                cell.number_format = "yyyy-mm-dd"
-            elif j == TIME_COL:
-                cell.number_format = "hh:mm"
+    worksheet.cell(row=target_row, column=DATE_COL).number_format = "yyyy-mm-dd"
+    worksheet.cell(row=target_row, column=TIME_COL).number_format = "hh:mm"
 
 
 def main() -> int:
@@ -280,21 +282,11 @@ def main() -> int:
     ensure_headers(worksheet)
 
     if action == "append":
-        last_row = find_last_non_empty_row(worksheet) or 1
-        next_row = last_row + 1
-        for col, header in enumerate(EXPECTED_HEADERS, start=1):
-            worksheet.cell(row=next_row, column=col, value=record[header])
-
-        worksheet.cell(row=next_row, column=DATE_COL).number_format = "yyyy-mm-dd"
-        worksheet.cell(row=next_row, column=TIME_COL).number_format = "hh:mm"
-        
-        # 排序
-        sort_worksheet(worksheet)
+        insert_row = find_insert_row(worksheet, record)
+        worksheet.insert_rows(insert_row, amount=1)
+        write_record(worksheet, insert_row, record)
         workbook.save(excel_path)
-
-        # 排序后行号会变，需要重新找回该 ID 的行号返回给用户
-        final_row = find_row_by_id(worksheet, record["ID"])
-        print(json.dumps({"row": final_row}, ensure_ascii=False))
+        print(json.dumps({"row": insert_row}, ensure_ascii=False))
         return 0
 
     if action == "invalidate_id":
