@@ -20,6 +20,7 @@ from append_excel_entry import (
     STATUS_PENDING,
     append_record_to_excel,
     convert_telegram_timestamp,
+    get_default_payment_channel,
     invalidate_record_by_id,
     load_bot_config,
     normalize_record,
@@ -756,7 +757,7 @@ def trigger_bot_restart(verbose: bool) -> None:
     if verbose: log_json({"stage": "restart_triggered"})
 
 
-def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
+def get_fallback_record(envelope: Dict[str, Any], bot_config: Dict[str, Any] | None = None) -> Dict[str, Any]:
     ts = envelope.get("telegram_timestamp")
     fallback_dt = convert_telegram_timestamp(ts, DEFAULT_TIMEZONE)
     date_str, time_str = fallback_dt.strftime("%Y-%m-%d"), fallback_dt.strftime("%H:%M")
@@ -771,7 +772,7 @@ def get_fallback_record(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "Type": "支出",
         "Category": "未分类",
         "Note": f"[AI失败兜底] {envelope['text']}",
-        "PaymentChannel": "",
+        "PaymentChannel": get_default_payment_channel(bot_config),
         "Status": "待确认",
     }
 
@@ -815,7 +816,7 @@ def handle_invalidate_command(runtime: RuntimeContext, envelope: Dict[str, Any])
 def apply_fallback_record(runtime: RuntimeContext, envelope: Dict[str, Any], ai_exc: Exception) -> tuple[Dict[str, Any], bool]:
     if runtime.verbose:
         log_message_event("message_processing_fallback", envelope, error=str(ai_exc))
-    record = get_fallback_record(envelope)
+    record = get_fallback_record(envelope, runtime.bot_config)
     normalized = normalize_record(record)
     sheet_name = record["Date"].split("-")[0]
     row = append_record_to_excel(runtime.excel_path, normalized, sheet_name, runtime.backend)

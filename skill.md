@@ -59,6 +59,7 @@ description: 维护 Telegram 记账机器人时使用。适用于排查消息处
 - 主链路要求：启动时一次性加载到内存，不做热加载
 - 不要在每次 LLM 调用时重新读取配置文件，除非用户明确要求改回实时读取
 - 新增“受配置驱动的枚举项”时，优先放到这个 JSON，而不是写死在 prompt 或 Python 常量里
+- 支付渠道默认值也走配置：`default_payment_channel` 必须放在 `bot_runtime/telegram_bot_config.json`，并且要属于 `payment_channels`
 
 ## 记录结构规则
 

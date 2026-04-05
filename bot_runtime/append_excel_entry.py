@@ -364,6 +364,16 @@ def get_payment_channels(config: Dict[str, Any] | None = None, config_path: Path
     return _clean_config_list(loaded_config.get("payment_channels"))
 
 
+def get_default_payment_channel(config: Dict[str, Any] | None = None, config_path: Path = DEFAULT_CONFIG_PATH) -> str:
+    loaded_config = config if config is not None else load_bot_config(config_path)
+    default_channel = str(loaded_config.get("default_payment_channel", "")).strip()
+    if not default_channel:
+        return ""
+    if default_channel not in get_payment_channels(config=loaded_config):
+        return ""
+    return default_channel
+
+
 def normalize_status(raw_value: Any) -> str:
     if raw_value in (None, "", False, 0, "0", "否"):
         return STATUS_NORMAL

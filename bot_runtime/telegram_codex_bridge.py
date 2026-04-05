@@ -12,6 +12,7 @@ from append_excel_entry import (
     append_record_to_excel,
     convert_telegram_timestamp,
     get_allowed_categories,
+    get_default_payment_channel,
     get_payment_channels,
     normalize_record,
     normalize_timezone,
@@ -38,7 +39,7 @@ PROMPT_RECORD_SHAPE: Dict[str, Any] = {
     "Type": "allowed type value",
     "Category": "string",
     "Note": "string",
-    "PaymentChannel": "configured payment channel or empty string",
+    "PaymentChannel": "configured payment channel",
     "Status": "",
 }
 
@@ -61,8 +62,8 @@ Rules:
 11. `Note` should capture the purpose or context only. Do not include the specific amount or currency in `Note`, and do not restate numeric details already captured in `Amount` unless absolutely necessary for meaning.
 12. For normal income/expense, `Category` must be one of: {categories}.
 13. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
-14. `PaymentChannel` must be one of: {payment_channels}. If the user did not explicitly mention a payment channel, return an empty string.
-15. Only fill `PaymentChannel` when the message explicitly indicates the channel. Do not guess.
+14. `PaymentChannel` must be one of: {payment_channels}.
+15. If the user explicitly mentioned a payment channel, use that exact configured value. Otherwise use the configured default payment channel: {default_payment_channel}.
 
 Telegram envelope:
 {envelope}
@@ -134,6 +135,7 @@ def _fill_defaults(record: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str,
     merged = dict(record)
     merged["Timezone"] = normalize_timezone(merged.get("Timezone", DEFAULT_TIMEZONE))
     tg_date, tg_time = _default_datetime(payload, merged["Timezone"])
+    default_payment_channel = get_default_payment_channel(_runtime_config(payload))
 
     # Telegram 消息的账本 ID 必须稳定且可回溯，不能信任模型输出的任意 ID。
     chat_id, msg_id = payload.get("chat_id"), payload.get("message_id")
@@ -149,8 +151,8 @@ def _fill_defaults(record: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str,
         merged["Time"] = tg_time
 
     if not str(merged.get("Currency", "")).strip(): merged["Currency"] = "CNY"
-    if "PaymentChannel" not in merged or merged.get("PaymentChannel") is None:
-        merged["PaymentChannel"] = ""
+    if not str(merged.get("PaymentChannel", "")).strip():
+        merged["PaymentChannel"] = default_payment_channel
     if "Status" not in merged: merged["Status"] = ""
     return merged
 
@@ -166,6 +168,7 @@ def emit_prompt(payload: Dict[str, Any]) -> str:
     runtime_config = _runtime_config(payload)
     allowed_categories = sorted(get_allowed_categories(config=runtime_config))
     payment_channels = get_payment_channels(config=runtime_config)
+    default_payment_channel = get_default_payment_channel(config=runtime_config) or "(none configured)"
     minimal_envelope = {
         "message_id": payload.get("message_id"),
         "chat_id": payload.get("chat_id"),
@@ -176,6 +179,7 @@ def emit_prompt(payload: Dict[str, Any]) -> str:
     return PROMPT_TEMPLATE.format(
         categories="|".join(allowed_categories),
         payment_channels="|".join(payment_channels) if payment_channels else "(none configured)",
+        default_payment_channel=default_payment_channel,
         output_shape=json.dumps(PROMPT_OUTPUT_SHAPE, ensure_ascii=False),
         record_shape=json.dumps(PROMPT_RECORD_SHAPE, ensure_ascii=False),
         envelope=json.dumps(minimal_envelope, ensure_ascii=False),
