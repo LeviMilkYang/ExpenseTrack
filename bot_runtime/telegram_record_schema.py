@@ -34,19 +34,39 @@ RECORD_PROPERTIES: Dict[str, Any] = {
     "Status": {"type": "string"},
 }
 
+TOOL_CALL_ARGUMENTS_PROPERTIES: Dict[str, Any] = {
+    "record": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": RECORD_REQUIRED_FIELDS,
+        "properties": RECORD_PROPERTIES,
+    },
+    "sheet_name": {"type": ["string", "null"]},
+}
+
+TOOL_CALL_PROPERTIES: Dict[str, Any] = {
+    "tool": {"type": "string", "enum": ["append_record"]},
+    "arguments": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["record", "sheet_name"],
+        "properties": TOOL_CALL_ARGUMENTS_PROPERTIES,
+    },
+}
+
 CODEX_OUTPUT_SCHEMA: Dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": ["ignored", "reason", "record"],
+    "required": ["ignored", "reason", "tool_call"],
     "properties": {
         "ignored": {"type": "boolean"},
         "reason": {"type": "string"},
-        "record": {
+        "tool_call": {
             "type": ["object", "null"],
             "additionalProperties": False,
-            "required": RECORD_REQUIRED_FIELDS,
-            "properties": RECORD_PROPERTIES,
+            "required": ["tool", "arguments"],
+            "properties": TOOL_CALL_PROPERTIES,
         },
     },
 }

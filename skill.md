@@ -24,7 +24,8 @@ description: 维护 Telegram 记账机器人时使用。适用于排查消息处
   LLM 前后处理层。负责：
   - 生成 prompt
   - 把 daemon 注入的运行时配置透传给 prompt
-  - 给模型输出补默认值
+  - 把模型输出从 `tool_call` 标准化成真实可执行的 Excel tool payload
+  - 给 `append_record` 补默认值
   - 决定写入哪个 sheet
 
 - `bot_runtime/append_excel_entry.py`
@@ -35,11 +36,17 @@ description: 维护 Telegram 记账机器人时使用。适用于排查消息处
   - 排序逻辑
   - 通过 helper 调 Windows Python + openpyxl 实际写表
 
+- `bot_runtime/excel_tools.py`
+  Excel tool 调度入口。负责：
+  - 用统一 JSON payload 调用 Excel 能力
+  - 暴露工具清单 `describe`
+  - 把 `append_record` / `invalidate_record` / `read_record` / `invalidate_last_record` 统一成后续 agent 可直接消费的接口
+
 - `bot_runtime/tmp_excel_helper/excel_append_helper.py`
   运行时 helper 的落地副本。它经常和 `append_excel_entry.py` 里的 `HELPER_CODE_OPENPYXL` 逻辑保持一致。排查 Excel 行为时，这两个文件都要一起看。
 
 - `bot_runtime/telegram_record_schema.py`
-  `codex exec --output-schema` 用的输出 schema。新增账本字段时，这里通常也要同步改。
+  `codex exec --output-schema` 用的输出 schema。当前主链路要求模型返回 `tool_call` 而不是直接返回 `record`。新增账本字段或新增 tool 时，这里通常也要同步改。
 
 ## 真实数据流
 
@@ -48,10 +55,12 @@ description: 维护 Telegram 记账机器人时使用。适用于排查消息处
 3. daemon 用内存中的配置构造 `runtime_config`
 4. `telegram_codex_bridge.py prompt` 生成 prompt
 5. daemon 调 `codex exec`
-6. `telegram_codex_bridge.py apply` 补默认字段并标准化
-7. `append_excel_entry.py` 调 helper 写入 Excel
+6. `telegram_codex_bridge.py apply` 把模型输出转成标准化 `tool_call`
+7. `excel_tools.py` / `append_excel_entry.py` 调 helper 写入 Excel
 8. helper 追加、排序、保存，再返回最终行号
 9. daemon 回 Telegram 发送确认消息，并把索引写到月度 index 文件
+
+补充：如果后续不是 daemon 直接调 Python 函数，而是 LLM/agent 走结构化 tool 调用，则应优先从 `excel_tools.py` 进入，再由它调用 `append_excel_entry.py` 中的底层能力。
 
 ## 配置规则
 
@@ -65,12 +74,17 @@ description: 维护 Telegram 记账机器人时使用。适用于排查消息处
 
 - 账本字段以 `append_excel_entry.py` 的 `EXPECTED_HEADERS` 为准
 - LLM 输出结构以 `telegram_record_schema.py` 为准
-- bridge 的 prompt 说明和默认值逻辑也要同步
+- bridge 的 prompt 说明、tool_call 结构和默认值逻辑也要同步
 - 新增字段时，通常至少要改这 4 处：
   - `telegram_record_schema.py`
   - `telegram_codex_bridge.py`
   - `append_excel_entry.py`
   - helper 代码/文件
+
+- 如果新增的是一个新的 Excel tool，而不是单纯新增 record 字段，则通常还要同步：
+  - `excel_tools.py`
+  - `telegram_codex_bridge.py` prompt 和 apply 逻辑
+  - `telegram_record_schema.py`
 
 ## Excel 相关高风险点
 

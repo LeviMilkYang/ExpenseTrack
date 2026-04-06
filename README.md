@@ -50,6 +50,8 @@
 - **时区声明**：消息里可以显式声明当前所在时区，例如 `UTC+0`、`UTC-5`、`UTC+05:30`。默认按 `UTC+08:00` 处理。
 - **报表联动**：`Status = 作废` 的记录不会计入统计，报表每月自动刷新。
 - **认证失败快速退出**：若 Telegram API 返回 `401 Unauthorized`，守护进程会记录致命认证错误并直接退出，避免持续刷日志。
+- **结构化 Excel tools**：可通过结构化 JSON 调用 `append_record`、`invalidate_record`、`read_record`、`invalidate_last_record`，为后续 agent/tool 扩展提供统一入口。
+- **LLM 输出改为 tool call**：Telegram 主链路里的 Codex 不再直接返回单条 record，而是返回结构化 `tool_call`，再由 Python 执行对应 Excel tool。
 
 ## 运行与维护
 
@@ -66,6 +68,16 @@ bash bot_runtime/restart_bot.sh
 查看当前月日志：
 ```bash
 tail -f bot_runtime/logs/$(date +"%Y-%m").log
+```
+
+查看当前可用 Excel tools：
+```bash
+python3 bot_runtime/excel_tools.py describe
+```
+
+以结构化 JSON 执行记账 tool：
+```bash
+python3 bot_runtime/excel_tools.py run --tool-json '{"tool":"append_record","arguments":{"record":{"ID":"manual_1","Date":"2026-04-06","Time":"09:30","Timezone":"UTC+08:00","Amount":12.5,"Currency":"CNY","Type":"支出","Category":"吃喝","Note":"早餐","PaymentChannel":"现金","Status":""},"sheet_name":"2026"}}'
 ```
 
 ## 依赖

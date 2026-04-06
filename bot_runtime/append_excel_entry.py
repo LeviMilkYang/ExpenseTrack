@@ -514,6 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--excel-path", default=str(DEFAULT_EXCEL_PATH))
     parser.add_argument("--sheet-name")
     parser.add_argument("--json")
+    parser.add_argument("--tool-json")
     parser.add_argument("--backend", default="openpyxl")
     return parser
 
@@ -521,14 +522,25 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    if not args.json:
-        print("Usage: --json '{\"ID\":\"...\", \"Date\":\"...\", ...}'")
+    try:
+        if args.tool_json:
+            from excel_tools import run_tool_payload
+
+            result = run_tool_payload(json.loads(args.tool_json), excel_path=args.excel_path, backend=args.backend)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+
+        if not args.json:
+            print("Usage: --json '{\"ID\":\"...\", \"Date\":\"...\", ...}' or --tool-json '{\"tool\":\"append_record\", ...}'")
+            return 1
+
+        record = json.loads(args.json)
+        row_num = append_record_to_excel(args.excel_path, record, args.sheet_name, args.backend)
+        print(json.dumps({"ok": True, "row": row_num}, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1
-    
-    record = json.loads(args.json)
-    row_num = append_record_to_excel(args.excel_path, record, args.sheet_name, args.backend)
-    print(json.dumps({"ok": True, "row": row_num}, ensure_ascii=False))
-    return 0
 
 
 if __name__ == "__main__":

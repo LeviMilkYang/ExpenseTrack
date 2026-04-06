@@ -9,7 +9,6 @@ from typing import Any, Dict
 
 from append_excel_entry import (
     DEFAULT_TIMEZONE,
-    append_record_to_excel,
     convert_telegram_timestamp,
     get_allowed_categories,
     get_default_payment_channel,
@@ -17,6 +16,7 @@ from append_excel_entry import (
     normalize_record,
     normalize_timezone,
 )
+from excel_tools import run_tool_payload
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -25,7 +25,7 @@ DEFAULT_EXCEL_PATH = PROJECT_DIR / "expense.xlsx"
 PROMPT_OUTPUT_SHAPE: Dict[str, Any] = {
     "ignored": "boolean",
     "reason": "string",
-    "record": "object|null",
+    "tool_call": "object|null",
 }
 
 PROMPT_RECORD_SHAPE: Dict[str, Any] = {
@@ -43,6 +43,14 @@ PROMPT_RECORD_SHAPE: Dict[str, Any] = {
     "Status": "",
 }
 
+PROMPT_TOOL_CALL_SHAPE: Dict[str, Any] = {
+    "tool": "append_record",
+    "arguments": {
+        "record": PROMPT_RECORD_SHAPE,
+        "sheet_name": "string|null",
+    },
+}
+
 PROMPT_TEMPLATE = """You convert one Telegram bookkeeping message into exactly one JSON object.
 
 Rules:
@@ -50,9 +58,9 @@ Rules:
 2. Always output this exact top-level shape:
 {output_shape}
 3. If the message is not about income or expense bookkeeping, set:
-{{"ignored":true,"reason":"short reason","record":null}}
-4. Otherwise set `"ignored": false`, `"reason": ""`, and make `record` use this schema:
-{record_shape}
+{{"ignored":true,"reason":"short reason","tool_call":null}}
+4. Otherwise set `"ignored": false`, `"reason": ""`, and make `tool_call` use this schema:
+{tool_call_shape}
 5. `Timezone` must always be present. If the user explicitly provides a UTC/GMT offset, return it normalized as `UTC+HH:MM` or `UTC-HH:MM`; otherwise return `UTC+08:00`.
 6. "DateProvided": Set true ONLY if the user explicitly provided a numeric date (like "3月12号", "2026-03-12", "12号").
 7. "TimeProvided": Set true ONLY if the user explicitly provided a numeric time (like "14:30", "2点半", "14点").
@@ -64,6 +72,8 @@ Rules:
 13. If the message is about transferring money to mother (for example: `给妈妈转账`, `给妈妈`, `转给妈妈`), `Category` must be `给妈妈`.
 14. `PaymentChannel` must be one of: {payment_channels}.
 15. If the user explicitly mentioned a payment channel, use that exact configured value. Otherwise use the configured default payment channel: {default_payment_channel}.
+16. For bookkeeping messages, always set `tool_call.tool` to `append_record`.
+17. Leave `tool_call.arguments.sheet_name` as null unless the user explicitly asked to target a specific sheet.
 
 Telegram envelope:
 {envelope}
@@ -106,17 +116,23 @@ def _runtime_config(payload: Dict[str, Any]) -> Dict[str, Any] | None:
     return runtime_config if isinstance(runtime_config, dict) else None
 
 
-def _coerce_record(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if "record" in payload and isinstance(payload["record"], dict):
-        return payload["record"]
+def _coerce_tool_call(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if "tool_call" in payload and isinstance(payload["tool_call"], dict):
+        return payload["tool_call"]
     for key in ("gemini_output", "codex_output"):
         if key in payload:
             output = payload[key]
             if isinstance(output, str):
                 try: output = json.loads(output)
                 except: continue
-            if isinstance(output, dict): return output.get("record", output)
-    raise ValueError("No record found in payload.")
+            if isinstance(output, dict):
+                tool_call = output.get("tool_call")
+                if isinstance(tool_call, dict):
+                    return tool_call
+                record = output.get("record")
+                if isinstance(record, dict):
+                    return {"tool": "append_record", "arguments": {"record": record}}
+    raise ValueError("No tool_call found in payload.")
 
 
 def _is_ignored_payload(payload: Dict[str, Any]) -> bool:
@@ -164,6 +180,27 @@ def _sheet_name_for_record(record: Dict[str, Any], explicit_sheet_name: str | No
     except: return None
 
 
+def _normalize_tool_call(tool_call: Dict[str, Any], payload: Dict[str, Any], explicit_sheet_name: str | None) -> Dict[str, Any]:
+    tool_name = str(tool_call.get("tool", "")).strip() or "append_record"
+    arguments = tool_call.get("arguments", {})
+    if not isinstance(arguments, dict):
+        raise ValueError("tool_call.arguments must be an object")
+
+    if tool_name != "append_record":
+        raise ValueError(f"Unsupported bookkeeping tool: {tool_name}")
+
+    record = _fill_defaults(arguments.get("record", {}), payload)
+    normalized_record = normalize_record(record)
+    resolved_sheet_name = _sheet_name_for_record(normalized_record, explicit_sheet_name or arguments.get("sheet_name"))
+    return {
+        "tool": tool_name,
+        "arguments": {
+            "record": normalized_record,
+            "sheet_name": resolved_sheet_name,
+        },
+    }
+
+
 def emit_prompt(payload: Dict[str, Any]) -> str:
     runtime_config = _runtime_config(payload)
     allowed_categories = sorted(get_allowed_categories(config=runtime_config))
@@ -181,12 +218,12 @@ def emit_prompt(payload: Dict[str, Any]) -> str:
         payment_channels="|".join(payment_channels) if payment_channels else "(none configured)",
         default_payment_channel=default_payment_channel,
         output_shape=json.dumps(PROMPT_OUTPUT_SHAPE, ensure_ascii=False),
-        record_shape=json.dumps(PROMPT_RECORD_SHAPE, ensure_ascii=False),
+        tool_call_shape=json.dumps(PROMPT_TOOL_CALL_SHAPE, ensure_ascii=False),
         envelope=json.dumps(minimal_envelope, ensure_ascii=False),
     )
 
 
-def apply_record(payload: Dict[str, Any], excel_path: str, sheet_name: str | None, backend: str, dry_run: bool) -> Dict[str, Any]:
+def apply_tool_call(payload: Dict[str, Any], excel_path: str, sheet_name: str | None, backend: str, dry_run: bool) -> Dict[str, Any]:
     if _is_ignored_payload(payload):
         reason = "not bookkeeping related"
         for key in ("gemini_output", "codex_output"):
@@ -199,13 +236,20 @@ def apply_record(payload: Dict[str, Any], excel_path: str, sheet_name: str | Non
                 break
         return {"ok": False, "ignored": True, "reason": reason}
 
-    record = _fill_defaults(_coerce_record(payload), payload)
-    normalized = normalize_record(record)
-    resolved_sheet_name = _sheet_name_for_record(normalized, sheet_name)
-    result = {"ok": True, "record": normalized, "sheet_name": resolved_sheet_name}
-    if dry_run: return result
-    row = append_record_to_excel(excel_path, normalized, resolved_sheet_name, backend)
-    result["row"] = row
+    normalized_tool_call = _normalize_tool_call(_coerce_tool_call(payload), payload, sheet_name)
+    result = {
+        "ok": True,
+        "tool_call": normalized_tool_call,
+        "record": normalized_tool_call["arguments"]["record"],
+        "sheet_name": normalized_tool_call["arguments"]["sheet_name"],
+    }
+    if dry_run:
+        return result
+
+    tool_result = run_tool_payload(normalized_tool_call, excel_path=excel_path, backend=backend)
+    result["tool"] = tool_result["tool"]
+    result["row"] = tool_result["result"].get("row")
+    result["tool_result"] = tool_result["result"]
     return result
 
 
@@ -229,7 +273,7 @@ def main() -> int:
         if args.mode == "prompt":
             print(emit_prompt(payload))
             return 0
-        result = apply_record(payload, args.excel_path, args.sheet_name, args.backend, args.dry_run)
+        result = apply_tool_call(payload, args.excel_path, args.sheet_name, args.backend, args.dry_run)
         print(json.dumps(result, ensure_ascii=False))
     except Exception as exc:
         print(json.dumps({"ok": False, "ignored": True, "reason": str(exc)}, ensure_ascii=False))

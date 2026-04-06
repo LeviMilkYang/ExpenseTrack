@@ -27,7 +27,7 @@ from append_excel_entry import (
     read_record_by_id,
 )
 from generate_expense_report import refresh_report_workbook
-from telegram_codex_bridge import apply_record as bridge_apply_record
+from telegram_codex_bridge import apply_tool_call as bridge_apply_tool_call
 from telegram_codex_bridge import emit_prompt as bridge_emit_prompt
 from telegram_record_schema import CODEX_OUTPUT_SCHEMA
 
@@ -567,7 +567,7 @@ def run_codex(workdir: Path, prompt: str) -> Dict[str, Any]:
 def run_bridge_apply(workdir: Path, envelope: Dict[str, Any], codex_output: Dict[str, Any], backend: str, excel_path: Path) -> Dict[str, Any]:
     payload = dict(envelope)
     payload["codex_output"] = codex_output
-    return bridge_apply_record(payload, str(excel_path), None, backend, False)
+    return bridge_apply_tool_call(payload, str(excel_path), None, backend, False)
 
 
 def send_reply(
